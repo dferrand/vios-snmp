@@ -72,6 +72,7 @@ class FakeVios(object):
                  get_empty=False, dump_empty=False, register_after=0,
                  agent_ip="10.17.10.21", local_ips=("10.17.10.21",), boots_present=True,
                  hostname="vios21", hosts_ips=("172.16.7.154",), dpid2="active",
+                 v1conf="", pkg="  bos.net.tcp.client            7.2.5.0        COMMITTED  TCP",
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
                  running_text=("pid=4122\n"
@@ -92,6 +93,8 @@ class FakeVios(object):
         self.local_ips = list(local_ips)
         self.boots_present = boots_present     # /etc/snmpd.boots exists
         self.dpid2 = dpid2                     # dpid2 subsystem status on the far side
+        self.v1conf = v1conf                   # /etc/snmpd.conf: ls line + active directives
+        self.pkg = pkg                         # lslpp for bos.net.tcp.client
         self.hostname = hostname
         self.hosts_ips = list(hosts_ips)       # what /etc/hosts says the hostname is
         self.register_after = register_after   # verify rounds in which children are absent
@@ -210,6 +213,8 @@ class FakeVios(object):
                "__VS_LOCALIP__",
                "\n".join("        inet %s netmask 0xffffff00 broadcast 10.0.0.255" % ip
                          for ip in self.local_ips),
+               "__VS_V1CONF__", self.v1conf or "ls: 0653-341 no such file",
+               "__VS_PKG__", self.pkg,
                "__VS_HOSTS__",
                "\n".join(["hostname=%s" % self.hostname]
                          + ["%s       %s" % (ip, self.hostname) for ip in self.hosts_ips]),
@@ -813,6 +818,21 @@ class AgentLinkTest(unittest.TestCase):
     def test_reset_boots_stands_on_its_own(self):
         with self.assertRaises(SystemExit):
             run(["--reset-boots", "--restart"], healthy())
+
+    def test_a_leftover_v1_config_is_shown(self):
+        # Nothing else in the report would reveal /etc/snmpd.conf.
+        fake = healthy(v1conf="-rw-r--r--    1 root     system   4294 Nov 18 2024  "
+                              "/etc/snmpd.conf\n snmpd  10.1.1.1  public")
+        rc, out, _ = run([], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("v1 conf    -rw-r--r--", out)
+        self.assertIn("public", out.split("v1 conf")[1].split("\n")[0])
+
+    def test_an_absent_v1_config_is_not_reported(self):
+        rc, out, _ = run([], healthy())
+        self.assertEqual(rc, 0)
+        self.assertNotIn("v1 conf", out)
+        self.assertIn("snmp pkg   bos.net.tcp.client 7.2.5.0", out)
 
     def test_recon_shows_the_listener_and_the_running_agent(self):
         rc, out, _ = run([], FakeVios())

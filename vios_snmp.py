@@ -128,6 +128,24 @@ def local_addresses(raw):
     return sorted(set(re.findall(r"inet\s+(\d+\.\d+\.\d+\.\d+)", raw)))
 
 
+def parse_pkg(raw):
+    """{fileset, level} for bos.net.tcp.client, plus any MIB daemon that is a symlink."""
+    out = {"level": "", "links": ""}
+    links = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("bos.net.tcp.client"):
+            f = s.split()
+            if len(f) >= 2:
+                out["level"] = f[1]
+        elif " -> " in s:
+            links.append(s.rsplit("/", 1)[-1])
+    out["links"] = " ".join(links)
+    return out
+
+
 def parse_host(raw):
     """{name, ips} for the local hostname and what /etc/hosts says it is."""
     name = ""
@@ -213,6 +231,14 @@ def probe(v):
         "grep 'Agent using IP address' /var/tmp/snmpdv3.log 2>/dev/null | tail -1",
         "echo __VS_LOCALIP__",
         "ifconfig -a 2>/dev/null | grep 'inet ' | head -8",
+        "echo __VS_V1CONF__",
+        # The children may still consult the v1 file; a leftover one is invisible
+        # in every other view of the configuration.
+        "ls -l /etc/snmpd.conf 2>&1 | head -1",
+        "grep -v '^#' /etc/snmpd.conf 2>/dev/null | grep . | head -4",
+        "echo __VS_PKG__",
+        "lslpp -L bos.net.tcp.client 2>/dev/null | grep 'bos.net.tcp.client' | head -2",
+        "ls -l /usr/sbin/snmpmibd /usr/sbin/hostmibd /usr/sbin/aixmibd 2>&1 | grep -- '->' | head -3",
         "echo __VS_HOSTS__",
         # A DPI2 child reaches the master by name, so what the name resolves to matters.
         "h=`hostname`; echo \"hostname=$h\"; grep -w \"$h\" /etc/hosts 2>/dev/null | head -3",
@@ -245,6 +271,10 @@ def probe(v):
     agent_ip = logged_agent_ip(block("__VS_AGENTIP__", "__VS_LOCALIP__"))
     local_ips = local_addresses(block("__VS_LOCALIP__", "__VS_HOSTS__"))
     host = parse_host(block("__VS_HOSTS__", "__VS_BOOTUP__"))
+    v1conf = " ".join(block("__VS_V1CONF__", "__VS_PKG__").split())
+    if "does not exist" in v1conf.lower() or "no such file" in v1conf.lower():
+        v1conf = ""                      # absent is the normal case, not worth a line
+    pkg = parse_pkg(block("__VS_PKG__", "__VS_HOSTS__"))
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -269,6 +299,8 @@ def probe(v):
         "agent_ip": agent_ip,
         "local_ips": local_ips,
         "host": host,
+        "v1conf": v1conf,
+        "pkg": pkg,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -609,6 +641,13 @@ def show_probe(p, host, args):
         print("  %-10s %s" % ("agent ip", p["agent_ip"]))
     if p.get("local_ips"):
         print("  %-10s %s" % ("local ips", ", ".join(p["local_ips"])))
+    if p.get("v1conf"):
+        print("  %-10s %s" % ("v1 conf", p["v1conf"][:100]))
+    pkg = p.get("pkg") or {}
+    if pkg.get("level"):
+        print("  %-10s bos.net.tcp.client %s%s" % ("snmp pkg", pkg["level"],
+                                                   "  (daemons linked: %s)" % pkg["links"]
+                                                   if pkg.get("links") else ""))
     host = p.get("host") or {}
     if host.get("name"):
         print("  %-10s %s%s" % ("host", host["name"],

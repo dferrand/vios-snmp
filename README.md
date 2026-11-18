@@ -201,6 +201,8 @@ a host whose files are already right and whose ODM is not.
   services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
   dpid2      inoperative
   agent ip   172.16.7.154
+  v1 conf    -rw-r--r-- 1 root system 1180 Nov 18 2024 /etc/snmpd.conf snmpd 172.16.7.154 public read
+  snmp pkg   bos.net.tcp.client 7.2.4.8
   local ips  10.17.10.21, 172.16.7.154
   host       vios21 -> 172.16.7.154 (from /etc/hosts)
   listen     tcp4 0 0 *.161 *.* LISTEN udp4 0 0 *.161 *.*
@@ -212,6 +214,11 @@ a host whose files are already right and whose ODM is not.
 reports. They are printed side by side and never compared: on a VIOS the address clients poll is
 often **NAT'd** while the agent's own is the real interface address, so a difference means
 nothing.
+
+`v1 conf` appears only when `/etc/snmpd.conf` exists — a leftover v1 configuration is invisible in
+every other view, and a stale community in it is one of the few things that can matter to a
+daemon other than the one this tool configures. `snmp pkg` is the `bos.net.tcp.client` level,
+which is what the agent and the MIB daemons all come from.
 
 `host` is the local hostname and what `/etc/hosts` says it is. A DPI2 child reaches the master
 **by name**, so a name that resolves to an address this host does not have (`local ips`) is the
