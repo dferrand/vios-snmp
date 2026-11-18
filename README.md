@@ -199,6 +199,7 @@ a host whose files are already right and whose ODM is not.
 ```
   agent      /usr/sbin/snmpdv3ne
   services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
+  dpid2      inoperative  (the DPI2 children connect to it, not to snmpd)
   agent ip   172.16.7.154
   local ips  10.17.10.21, 172.16.7.154
   host       vios21 -> 172.16.7.154 (from /etc/hosts)
@@ -230,6 +231,15 @@ says, so it cannot tell you which agent is actually running.
 Those two lines are what a child's `1473-665 Connect to SNMP agent failed` is about: the agent
 has to be listening on a socket the child can reach, and the process has to be the agent the
 link points at.
+
+## The DPI2 proxy
+
+`dpid2` is listed on its own because every MIB subtree depends on it: the three children are
+DPI2 subagents that register through `dpid2`, not directly with `snmpd`. Its start line ships
+commented out in `rc.tcpip`, so a VIOS can have `snmpd` answering `system` — served by the
+master itself — while `snmpmibd`, `hostmibd` and `aixmibd` all answer `noSuchName`, each
+logging `1473-665 Connect to SNMP agent failed`. `--restart` starts it when it is down, and the
+failure hint says so.
 
 ## Report-only findings
 

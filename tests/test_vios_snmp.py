@@ -71,7 +71,7 @@ class FakeVios(object):
                  agent_link="snmpdv3ne", ssw_sticks=True,
                  get_empty=False, dump_empty=False, register_after=0,
                  agent_ip="10.17.10.21", local_ips=("10.17.10.21",), boots_present=True,
-                 hostname="vios21", hosts_ips=("172.16.7.154",),
+                 hostname="vios21", hosts_ips=("172.16.7.154",), dpid2="active",
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
                  running_text=("pid=4122\n"
@@ -91,6 +91,7 @@ class FakeVios(object):
         self.agent_ip = agent_ip               # what /var/tmp/snmpdv3.log says it initialised from
         self.local_ips = list(local_ips)
         self.boots_present = boots_present     # /etc/snmpd.boots exists
+        self.dpid2 = dpid2                     # dpid2 subsystem status on the far side
         self.hostname = hostname
         self.hosts_ips = list(hosts_ips)       # what /etc/hosts says the hostname is
         self.register_after = register_after   # verify rounds in which children are absent
@@ -162,6 +163,8 @@ class FakeVios(object):
         if cmd.startswith("cp -p") and "snmpdv3.conf.bak " in cmd:
             return 0, self._restore()
         if "stopsrc" in cmd or "startsrc" in cmd:
+            if re.search(r"startsrc -s dpid2", cmd):
+                self.dpid2 = "active"
             return 0, self._services(cmd)
         return 0, ""
 
@@ -214,6 +217,7 @@ class FakeVios(object):
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
             out += [name, " %s        tcpip      %-8s %s" % (s, 1234, self.services[s])]
+        out += ["__VS_SVC__dpid2", " dpid2        tcpip      %-8s %s" % (1234, self.dpid2)]
         for s in S.SUBAGENTS:
             out += ["__VS_CMD__" + s, self._odm(s), "__VS_LSSRC__" + s, self._src_row(s)]
         return "\n".join(out + ["__VS_CONF__", self.files[S.CONF].rstrip("\n"),
@@ -655,6 +659,26 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL aixmibd", out)
         self.assertIn("bounce the four daemons in order", out)
+
+    def test_all_children_missing_points_at_dpid2(self):
+        # What 10.17.10.21 shows: every subtree absent, because the proxy is down.
+        fake = healthy(dpid2="inoperative", bodies={k: ("noSuchName at position 1", 0)
+                                                    for k in ("system", "snmpmibd",
+                                                              "aixmibd", "hostmibd")})
+        fake.bodies.pop("system")
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("dpid2      inoperative", out)
+        self.assertIn("dpid2 is inoperative", out)
+        self.assertIn("startsrc -s dpid2", out)
+
+    def test_restart_starts_dpid2_when_it_is_down(self):
+        fake = healthy(dpid2="inoperative")
+        with unittest.mock.patch.object(T, "SETTLE_PAUSE", 0):
+            rc, out, _ = run(["--restart"], fake)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(fake.dpid2, "active")
+        self.assertIn("startsrc -s dpid2", " ".join(fake.calls))
 
     def test_a_nosuchname_subtree_gets_the_registration_hint(self):
         # What 10.17.10.21 said: the master answers, the subtree is not in its tree.

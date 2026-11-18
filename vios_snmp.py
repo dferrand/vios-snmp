@@ -152,8 +152,9 @@ def parse_running(raw):
             out["exe"] = s.split(" -> ", 1)[1].strip()
         elif "/usr/sbin/snmpd" in s:
             f = s.split()
-            if len(f) >= 5:
+            if len(f) >= 8:
                 out["since"] = f[4]
+                out["argv"] = " ".join(f[7:])[:80]
     return out
 
 
@@ -308,6 +309,9 @@ def run_services(v, enabled, stop=False):
     ]
     # The children's first connect attempt happens the moment they start, so let
     # snmpd finish listening first: 1473-665 in a child's log is that race.
+    # dpid2 is the proxy the children connect to; without it they never register.
+    lines += ['lssrc -s dpid2 >/dev/null 2>&1 && (lssrc -s dpid2 2>/dev/null | grep -q active '
+              '|| startsrc -s dpid2)', "sleep 2"]
     lines.append("sleep 5")
     for sub in subs:
         lines.append("lssrc -s %s 2>/dev/null | grep -q active || startsrc -s %s" % (sub, sub))
@@ -477,9 +481,9 @@ SETTLE_SECONDS = 60
 SETTLE_PAUSE = 10
 
 
-def verify_settled(v, community, enabled, cmdargs, agent=""):
+def verify_settled(v, p, community, enabled, cmdargs):
     """verify(), then wait for subagent subtrees to show up."""
-    results = verify(v, community, enabled, cmdargs, agent)
+    results = verify(v, p, community, enabled, cmdargs)
     deadline = time.time() + SETTLE_SECONDS
     waiting = False
     while time.time() < deadline and any(not r["ok"] for r in results
@@ -489,12 +493,16 @@ def verify_settled(v, community, enabled, cmdargs, agent=""):
                 "keeps trying)")
             waiting = True
         time.sleep(SETTLE_PAUSE)
-        results = verify(v, community, enabled, cmdargs, agent)
+        results = verify(v, p, community, enabled, cmdargs)
     return results
 
 
-def subagent_hint(body, sub, siblings_ok=False):
+def subagent_hint(body, sub, siblings_ok=False, dpid2=""):
     """Why a subagent can run with the right community and still serve nothing."""
+    if dpid2 and dpid2 != "active":
+        return ("dpid2 is %s: the DPI2 children connect to that proxy, not to snmpd "
+                "directly, so none of them can register. startsrc -s dpid2, and start it "
+                "at boot too (its rc.tcpip line ships commented out)" % dpid2)
     if "No response" in body or "Timeout" in body or "0821-103" in body:
         return ("nothing answered for that community: check that snmpd is running and that "
                 "the COMMUNITY line accepts it (the system check says whether the master "
@@ -511,7 +519,7 @@ def subagent_hint(body, sub, siblings_ok=False):
             "--apply when it has changes to make)")
 
 
-def verify(v, community, enabled, cmdargs, agent=""):
+def verify(v, p, community, enabled, cmdargs):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
     Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
@@ -528,6 +536,7 @@ def verify(v, community, enabled, cmdargs, agent=""):
       them it answers nothing rather than failing.
     """
     q = community or "public"
+    agent = p.get("agent", "")
     subs = [s for s in S.SUBAGENTS if s in enabled]
     tests = []              # (key, [command, ...], needles that prove an answer)
     tests.append(("system",
@@ -590,7 +599,8 @@ def verify(v, community, enabled, cmdargs, agent=""):
         if not ok and key in S.SUBAGENTS and cmd_check is not None and cmd_check["ok"]:
             # The subagent demonstrably runs with the community, so the failure is
             # about the answer, not the credential.
-            r["hint"] = subagent_hint(body, key, siblings_ok and key != "snmpmibd")
+            r["hint"] = subagent_hint(body, key, siblings_ok and key != "snmpmibd",
+                                      p.get("dpid2", ""))
         results.append(r)
     return results
 
@@ -601,6 +611,10 @@ def show_probe(p, host, args):
     print("%s  (VIOS %s)" % (host, p["level"]))
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
+    if p.get("dpid2") and p["dpid2"] != "unknown":
+        print("  %-10s %s%s" % ("dpid2", p["dpid2"],
+                                "" if p["dpid2"] == "active" else
+                                "  (the DPI2 children connect to it, not to snmpd)"))
     if p.get("agent_ip"):
         print("  %-10s %s" % ("agent ip", p["agent_ip"]))
     if p.get("local_ips"):
@@ -614,7 +628,8 @@ def show_probe(p, host, args):
         print("  %-10s %s" % ("listen", p["listen"]))
     run = p.get("running") or {}
     if run.get("pid") or run.get("exe"):
-        print("  %-10s %s %s%s" % ("running", run.get("pid", "?"), run.get("exe") or "(exe unknown)",
+        print("  %-10s %s %s%s" % ("running", run.get("pid", "?"),
+                                   run.get("exe") or run.get("argv") or "(unknown)",
                                    " since %s" % run["since"] if run.get("since") else ""))
     auto = S.rc_autostart(p["rc_tcpip"])
     print("  %-10s %s" % ("at boot", ", ".join("%s %s" % (s, "yes" if auto[s] else "no") for s in S.SUBSYSTEMS)))
@@ -901,7 +916,7 @@ def main(argv=None):
             report["community"] = comm
             if not args.json:
                 print("\ntesting with community '%s' (no writes)" % comm)
-            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
+            results = verify(v, p, comm, enabled, S.cmdargs_desired(comm, enabled))
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             report["ok"] = not failed
@@ -921,9 +936,8 @@ def main(argv=None):
                 print("\n/etc/snmpd.boots %s; restarting the four daemons in order"
                       % ("moved aside" if moved else "was not there"))
             run_services(v, enabled, stop=True)
-            return finish_verify(report, verify_settled(v, comm, enabled,
-                                                        S.cmdargs_desired(comm, enabled),
-                                                        p["agent"]),
+            return finish_verify(report, verify_settled(v, p, comm, enabled,
+                                                        S.cmdargs_desired(comm, enabled)),
                                  args, "reset and verified")
 
         if args.restart:                             # bounce the daemons, then check them
@@ -942,9 +956,8 @@ def main(argv=None):
                     print("\nbouncing %s, master left running (no writes)"
                           % (", ".join(subs) or "nothing"))
                 bounce_subsystems(v, subs)
-            return finish_verify(report, verify_settled(v, comm, enabled,
-                                                        S.cmdargs_desired(comm, enabled),
-                                                        p["agent"]),
+            return finish_verify(report, verify_settled(v, p, comm, enabled,
+                                                        S.cmdargs_desired(comm, enabled)),
                                  args, "restarted and verified")
 
         if not args.community:                      # recon only
@@ -1018,7 +1031,7 @@ def main(argv=None):
             if not args.json:
                 print("\napplied to %s; daemons left alone (--no-restart)" % args.host)
         else:
-            results = verify_settled(v, args.community, enabled, cmdargs, p["agent"])
+            results = verify_settled(v, p, args.community, enabled, cmdargs)
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             if failed:
