@@ -75,6 +75,40 @@ def _first_row(text, minfields=3):
     return ""
 
 
+# The two agents that read /etc/snmpdv3.conf. Anything else linked at
+# /usr/sbin/snmpd means a different configuration file, i.e. a different tool.
+AGENTS_OK = ("snmpdv3ne", "snmpdv3e")
+
+
+def agent_target(ls_line):
+    """The absolute path /usr/sbin/snmpd resolves to, from its `ls -l` line.
+
+    AIX usually links it relatively (`snmpd -> snmpdv3ne`), so the target is
+    resolved against /usr/sbin rather than compared as text.
+    """
+    if " -> " not in ls_line:
+        return ""
+    target = ls_line.split(" -> ", 1)[1].strip()
+    if not target.startswith("/"):
+        target = os.path.normpath(os.path.join("/usr/sbin", target))
+    return target
+
+
+def agent_state(agent):
+    """(ok, message) for the agent behind /usr/sbin/snmpd; a message is always worth printing."""
+    if not agent:
+        return False, ("/usr/sbin/snmpd is not a symlink: cannot tell which agent is installed, "
+                       "and /etc/snmpdv3.conf is only read by snmpdv3ne/snmpdv3e")
+    name = agent.rsplit("/", 1)[-1]
+    if name == "snmpdv3ne":
+        return True, ""
+    if name == "snmpdv3e":
+        return True, ("/usr/sbin/snmpd -> %s: the encrypted agent, which needs the snmp.crypto "
+                      "fileset (snmpv3_ssw -l shows the mode)" % agent)
+    return False, ("/usr/sbin/snmpd -> %s, not snmpdv3ne: that agent does not read "
+                   "/etc/snmpdv3.conf, so configuring it is not what this tool does" % agent)
+
+
 def cmdargs_script(subs):
     """Far-side reads of the SRC subsystem object, one block per subagent.
 
@@ -137,7 +171,7 @@ def probe(v):
         b = out.find(end, a + 1) if a >= 0 else -1
         return out[a + len(start):b].strip("\n") if a >= 0 and b > a else ""
 
-    agent = block("__VS_AGENT__", "__VS_BOOTUP__").strip().split("\n")[0]
+    agent_line = block("__VS_AGENT__", "__VS_BOOTUP__").strip().split("\n")[0]
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -153,7 +187,10 @@ def probe(v):
             svc[sub] = "unknown"
     return {
         "level": V.level(v),
-        "agent": agent,
+        # Resolved, so `snmpd -> snmpdv3ne` and `snmpd -> /usr/sbin/snmpdv3ne`
+        # read the same; the raw line is kept for the report.
+        "agent": agent_target(agent_line),
+        "agent_raw": agent_line,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -247,7 +284,14 @@ def snmp_failure(body):
     return any(m in body for m in SNMP_FAILURES)
 
 
-def verify(v, community, enabled, cmdargs):
+def verify_agent(agent):
+    """The link itself: /etc/snmpdv3.conf is only read by snmpdv3ne/snmpdv3e."""
+    ok, msg = agent_state(agent)
+    return {"check": "agent", "command": "ls -l /usr/sbin/snmpd", "ok": ok,
+            "rc": 0 if ok else 1, "output": msg or agent}
+
+
+def verify(v, community, enabled, cmdargs, agent=""):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
     Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
@@ -273,7 +317,7 @@ def verify(v, community, enabled, cmdargs):
         script += ['echo "__VS_T_%s__"' % key, "(%s) 2>&1" % cmd, 'echo "__VS_T_%s_rc__=$?"' % key]
     rc, out = v.root("\n".join(script), timeout=180)
 
-    results = []
+    snmp = []
     for key, cmd, needles in tests:
         head = "__VS_T_%s__" % key
         mrc = out.split("__VS_T_%s_rc__=" % key, 1)
@@ -282,20 +326,23 @@ def verify(v, community, enabled, cmdargs):
         ok = code == 0 and bool(body.strip()) and not snmp_failure(body)
         if ok and needles:
             ok = any(n in body for n in needles)
-        results.append({"check": key, "command": cmd, "ok": ok, "rc": code,
-                        "output": body.strip()[:400]})
+        snmp.append({"check": key, "command": cmd, "ok": ok, "rc": code,
+                     "output": body.strip()[:400]})
+    # The link comes first: if it is not a v3 agent, every other check is
+    # measuring the wrong daemon, or a file nothing reads.
+    results = [verify_agent(agent)]
     if subs:
-        # First, so a wrong community on the subagents is named as the cause
-        # rather than showing up as an empty aixMIB subtree.
-        results.insert(0, verify_cmdargs(v, subs, cmdargs))
-    return results
+        # A wrong community on the subagents is named as the cause rather than
+        # showing up as an empty aixMIB subtree.
+        results.append(verify_cmdargs(v, subs, cmdargs))
+    return results + snmp
 
 
 # --------------------------------------------------------------------- report
 
 def show_probe(p, host, args):
     print("%s  (VIOS %s)" % (host, p["level"]))
-    print("  %-10s %s" % ("agent", p["agent"] or "?"))
+    print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
     auto = S.rc_autostart(p["rc_tcpip"])
     print("  %-10s %s" % ("at boot", ", ".join("%s %s" % (s, "yes" if auto[s] else "no") for s in S.SUBSYSTEMS)))
@@ -505,11 +552,19 @@ def main(argv=None):
                                       for s, b, a in cmd_changes],
                   "verify": [], "ok": True}
         drift = bool(conf_changes or rc_changes or cmd_changes)
+        # The link decides which file this tool may edit at all, so it is a
+        # finding on every run and a hard stop for --apply.
+        agent_ok, agent_msg = agent_state(p["agent"])
+        if agent_msg:
+            report["findings"].insert(0, agent_msg)
 
         if not args.json:
             show_probe(p, args.host, args)
             for f in report["findings"]:
                 print("  %-10s %s" % ("finding", f))
+
+        if args.apply and not agent_ok:
+            raise V.Abort("%s: %s" % (args.host, agent_msg))
 
         if args.test:                                # read-only: prove what it answers now
             # Test with the community the host is configured for unless one is
@@ -518,7 +573,7 @@ def main(argv=None):
             report["community"] = comm
             if not args.json:
                 print("\ntesting with community '%s' (no writes)" % comm)
-            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled))
+            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             report["ok"] = not failed
@@ -589,7 +644,7 @@ def main(argv=None):
             if not args.json:
                 print("\napplied to %s; daemons left alone (--no-restart)" % args.host)
         else:
-            results = verify(v, args.community, enabled, cmdargs)
+            results = verify(v, args.community, enabled, cmdargs, p["agent"])
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             if failed:

@@ -57,10 +57,16 @@ With no `--community` it tests the community the host is configured for — the 
 
 | check | command | proves |
 |---|---|---|
+| `agent` | `ls -l /usr/sbin/snmpd` | the link resolves to `snmpdv3ne` (or `snmpdv3e`), the only agents that read `/etc/snmpdv3.conf` |
 | `cmdargs` | `odmget -q subsysname=<sub> SRCsubsys`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
 | `system` | `snmpinfo -md -v -c <c> system` | the master answers on 161 (`sysDescr`) |
 | `aixmibd` | `snmpinfo -md -c <c> aixpagingspace` | the aixMIB subtree is registered |
 | `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1` | the hrSystem group is registered |
+
+AIX links it relatively (`snmpd -> snmpdv3ne`), so the target is resolved against
+`/usr/sbin` and compared as a path, not as text. `snmpdv3e` — the encrypted agent — passes
+with a note about the `snmp.crypto` fileset; anything else fails the test, and `--apply`
+refuses to write a file that agent would never read.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).

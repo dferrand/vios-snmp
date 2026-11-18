@@ -61,8 +61,12 @@ class FakeVios(object):
 
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
                  chssys_sticks=True, ps_hides=False, bodies=None,
-                 odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False):
+                 odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
+                 agent_link="snmpdv3ne"):
         self.host = "vios1"
+        # The real host prints a relative target: `snmpd -> snmpdv3ne`.
+        self.agent_line = ("lrwxrwxrwx    1 root     system            9 Oct 06 12:59 "
+                           "/usr/sbin/snmpd -> %s" % agent_link)
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -152,7 +156,7 @@ class FakeVios(object):
                 '\tgrpname = "tcpip"\n') % (sub, self.cmdargs.get(sub, ""), sub)
 
     def _probe(self):
-        out = ["__VS_AGENT__", "lrwxrwxrwx 1 root system 9 Nov  9 2015 /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne",
+        out = ["__VS_AGENT__", self.agent_line,
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -453,14 +457,14 @@ class TestModeTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL system", out)
         self.assertIn("0821-103", out)
-        self.assertIn("3 of 4 checks failed", out)
+        self.assertIn("3 of 5 checks failed", out)
 
     def test_nosuchname_fails_even_when_snmpinfo_exits_zero(self):
         fake = healthy(bodies={"hostmibd": (fixture("snmpinfo.nosuchname.txt"), 0)})
         rc, out, _ = run(["--test"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("FAIL hostmibd", out)
-        self.assertIn("1 of 4 checks failed", out)
+        self.assertIn("1 of 5 checks failed", out)
 
     def test_json_test_report(self):
         rc, out, _ = run(["--test", "--json"], healthy())
@@ -468,7 +472,7 @@ class TestModeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(report["ok"])
         self.assertEqual(report["community"], COMMUNITY)
-        self.assertEqual(len(report["verify"]), 4)
+        self.assertEqual(len(report["verify"]), 5)
 
     def test_test_and_apply_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
@@ -549,6 +553,62 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL hostmibd", out)
         self.assertIn("no output", out)
+
+
+class AgentLinkTest(unittest.TestCase):
+    """/usr/sbin/snmpd must resolve to snmpdv3ne (or snmpdv3e): the file edited depends on it."""
+
+    def test_a_relative_target_resolves_under_usr_sbin(self):
+        line = "lrwxrwxrwx    1 root     system   9 Oct 06 12:59 /usr/sbin/snmpd -> snmpdv3ne"
+        self.assertEqual(T.agent_target(line), "/usr/sbin/snmpdv3ne")
+
+    def test_an_absolute_target_is_kept(self):
+        line = "lrwxrwxrwx 1 root system 9 Nov  9 2015 /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne"
+        self.assertEqual(T.agent_target(line), "/usr/sbin/snmpdv3ne")
+
+    def test_a_plain_file_is_not_a_symlink(self):
+        line = "-rwxr-xr-x 1 root system 9 Nov  9 2015 /usr/sbin/snmpd"
+        self.assertEqual(T.agent_target(line), "")
+        self.assertFalse(T.agent_state("")[0])
+
+    def test_the_v3_agent_is_accepted(self):
+        self.assertEqual(T.agent_state("/usr/sbin/snmpdv3ne"), (True, ""))
+
+    def test_the_encrypted_agent_is_accepted_with_a_note(self):
+        ok, msg = T.agent_state("/usr/sbin/snmpdv3e")
+        self.assertTrue(ok)
+        self.assertIn("snmp.crypto", msg)
+
+    def test_another_agent_is_refused(self):
+        ok, msg = T.agent_state("/usr/sbin/snmpdv1")
+        self.assertFalse(ok)
+        self.assertIn("not snmpdv3ne", msg)
+
+    def test_recon_shows_the_resolved_target(self):
+        rc, out, _ = run([], FakeVios())
+        self.assertEqual(rc, 0)
+        self.assertIn("agent      /usr/sbin/snmpdv3ne", out)
+
+    def test_test_mode_fails_on_the_wrong_agent(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1")
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL agent", out)
+
+    def test_apply_refuses_on_the_wrong_agent(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1")
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("not snmpdv3ne", err)
+        self.assertFalse([c for c in fake.calls if "chssys" in c or c.startswith("cp ")])
+        self.assertEqual(fake.puts, {})
+
+    def test_the_encrypted_agent_is_reported_but_not_blocked(self):
+        fake = healthy(agent_link="snmpdv3e")
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("ok   agent", out)
+        self.assertIn("snmp.crypto", out)
 
 
 if __name__ == "__main__":
