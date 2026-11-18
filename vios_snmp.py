@@ -285,7 +285,7 @@ def verify_cmdargs(v, subs, desired):
 SNMP_FAILURES = ("0821-103", "No response", "No Response", "Timeout", "timed out",
                  "noSuchName", "noSuchObject", "is not running",
                  # a bad flag prints the usage text and exits 2 or 0
-                 "Usage:", "Not a recognized flag")
+                 "Usage:", "Not a recognized flag", "Invalid func")
 
 
 def snmp_failure(body):
@@ -352,40 +352,66 @@ def run_checks(v, items):
     return got
 
 
+def answered(pair):
+    """True when a (rc, body) from run_checks is a real answer.
+
+    An empty body, an snmpinfo error or a usage message from a bad flag is not.
+    """
+    if not pair:
+        return False
+    code, body = pair
+    return code == 0 and bool(body) and not snmp_failure(body)
+
+
 def verify(v, community, enabled, cmdargs, agent=""):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
     Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
-    change. snmpinfo can exit 0 while printing an error, so the text is checked
-    for the failure strings as well as the exit code.
+    change.
 
-    Each subtree gets a second, plainer question if the first comes back empty:
-    `-md` resolves a name through the client's MIB files and can answer nothing at
-    all, where `-m walk` on the numbered subtree asks the agent directly.
+    Each check carries several forms, tried in order until one answers, because
+    snmpinfo's modes differ by level and one of them can be silent for a healthy
+    agent:
+
+    * `-m get <numeric instance>` needs no MIB file and is the plainest question;
+      this snmpinfo's modes are `get|next|set|dump` (there is no `walk`).
+    * `-m dump <name>` is IBM's documented form and prints the readable subtree,
+      but it resolves the name through the client's MIB files: on a VIOS without
+      them it answers nothing rather than failing.
     """
     q = community or "public"
     subs = [s for s in S.SUBAGENTS if s in enabled]
-    tests = []              # (key, command, needles, fallback command or None)
-    tests.append(("system", 'snmpinfo -md -v -c "%s" system' % q, ("sysDescr",), None))
+    tests = []              # (key, [command, ...], needles that prove an answer)
+    tests.append(("system",
+                  ['snmpinfo -m get -c "%s" 1.3.6.1.2.1.1.1.0' % q,
+                   'snmpinfo -md -v -c "%s" system' % q],
+                  ("sysDescr", "1.3.6.1.2.1.1.1.0")))
     if "aixmibd" in subs:
-        # snmpinfo prints numeric OIDs when it cannot resolve the MIB name (VIOS
-        # 4.1 does), so the subtree OID proves the same thing as the symbol.
-        tests.append(("aixmibd", 'snmpinfo -md -c "%s" aixpagingspace' % q,
-                      ("aixPageThreshold", S.AIX_SUBTREE),
-                      'snmpinfo -m walk -c "%s" %s' % (q, S.AIX_SUBTREE)))
+        tests.append(("aixmibd",
+                      ['snmpinfo -m get -c "%s" %s.2.4.1.0' % (q, S.AIX_SUBTREE),
+                       'snmpinfo -md -c "%s" aixpagingspace' % q,
+                       'snmpinfo -md -c "%s" %s' % (q, S.AIX_SUBTREE)],
+                      ("aixPageThreshold", S.AIX_SUBTREE)))
     if "hostmibd" in subs:
-        tests.append(("hostmibd", 'snmpinfo -md -c "%s" 1.3.6.1.2.1.25' % q, (),
-                      'snmpinfo -m walk -c "%s" 1.3.6.1.2.1.25' % q))
+        tests.append(("hostmibd",
+                      ['snmpinfo -m get -c "%s" 1.3.6.1.2.1.25.1.1.0' % q,
+                       'snmpinfo -md -c "%s" 1.3.6.1.2.1.25' % q],
+                      ("hrSystemUptime", "1.3.6.1.2.1.25")))
 
-    got = run_checks(v, [(key, cmd) for key, cmd, _, _ in tests])
-    retry = [(key, fb) for key, cmd, _, fb in tests if fb and not got[key][1]]
-    used = {}
-    if retry:
-        again = run_checks(v, retry)
-        for key, fb in retry:
-            if again[key][1]:
-                got[key] = again[key]
-                used[key] = fb
+    got = {}                # key -> the answer that passed, or the first one that failed
+    used = {}               # key -> the command that produced it
+    for i in range(max(len(cmds) for _, cmds, _ in tests)):
+        batch = [(key, cmds[i]) for key, cmds, _ in tests
+                 if i < len(cmds) and not answered(got.get(key))]
+        if not batch:
+            break
+        res = run_checks(v, batch)
+        for key, cmd in batch:
+            if answered(res[key]):
+                got[key] = res[key]
+                used[key] = cmd
+            elif key not in got:
+                got[key] = res[key]      # the first failure is the evidence to show
 
     # The link comes first: if it is not a v3 agent, every other check is
     # measuring the wrong daemon, or a file nothing reads.
@@ -397,22 +423,22 @@ def verify(v, community, enabled, cmdargs, agent=""):
         cmd_check = verify_cmdargs(v, subs, cmdargs)
         results.append(cmd_check)
 
-    for key, cmd, needles, fallback in tests:
-        code, body = got[key]
-        ok = code == 0 and bool(body) and not snmp_failure(body)
+    for key, cmds, needles in tests:
+        code, body = got.get(key, (1, ""))
+        ok = answered((code, body))
         if ok and needles:
             ok = any(n in body for n in needles)
-        r = {"check": key, "command": used.get(key, cmd), "ok": ok, "rc": code,
+        r = {"check": key, "command": used.get(key, cmds[0]), "ok": ok, "rc": code,
              "output": body[:400]}
-        if not ok and key in S.SUBAGENTS and not body and not used.get(key) \
+        if not ok and key in S.SUBAGENTS and not body \
                 and cmd_check is not None and cmd_check["ok"]:
-            # Both forms are empty while the subagent demonstrably runs with the
+            # No form answered while the subagent demonstrably runs with the
             # community: the usual cause is a DPI2 child that registered with a
             # master that has since been replaced.
-            r["hint"] = ("the subagent runs with the community but answers nothing: DPI2 "
-                         "children register with the master that was running when they "
-                         "started, so bounce the four daemons in order (--restart, or "
-                         "--apply when it has changes to make)")
+            r["hint"] = ("the subagent runs with the community but answers nothing to any "
+                         "form: DPI2 children register with the master that was running "
+                         "when they started, so bounce the four daemons in order (--restart, "
+                         "or --apply when it has changes to make)")
         results.append(r)
     return results
 

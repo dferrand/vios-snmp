@@ -63,9 +63,9 @@ With no `--community` it tests the community the host is configured for — the 
 |---|---|---|
 | `agent` | `ls -l /usr/sbin/snmpd` | the link resolves to `snmpdv3ne` (or `snmpdv3e`), the only agents that read `/etc/snmpdv3.conf` |
 | `cmdargs` | `odmget -q subsysname=<sub> SRCsubsys`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
-| `system` | `snmpinfo -md -v -c <c> system` | the master answers on 161 (`sysDescr`) |
-| `aixmibd` | `snmpinfo -md -c <c> aixpagingspace` | the aixMIB subtree is registered |
-| `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1` | the hrSystem group is registered |
+| `system` | `snmpinfo -m get -c <c> 1.3.6.1.2.1.1.1.0` | the master answers on 161 (`sysDescr`) |
+| `aixmibd` | `snmpinfo -m get -c <c> 1.3.6.1.4.1.2.6.191.2.4.1.0` | aixmibd serves `aixPageThreshold` |
+| `hostmibd` | `snmpinfo -m get -c <c> 1.3.6.1.2.1.25.1.1.0` | hostmibd serves `hrSystemUptime` |
 
 AIX links it relatively (`snmpd -> snmpdv3ne`), so the target is resolved against
 `/usr/sbin` and compared as a path, not as text. `snmpdv3e` — the encrypted agent — passes
@@ -95,10 +95,12 @@ back with the matching flag (`-1` for `snmpdv1`, `-e` for `snmpdv3e`); a target 
 cannot select (a hand-made link to something else) is left at `snmpdv3ne`, and the rollback
 says so.
 
-A subtree that answers nothing to the `-md` form is asked again with
-`snmpinfo -m walk -c <c> <numeric subtree>`: `-md` resolves the name through the client's MIB
-files, so a missing MIB on the VIOS can make a working subagent look dead, while the numeric
-walk asks the agent directly. `--json` shows which form answered.
+Each check carries several forms and uses the first one that answers, because this `snmpinfo`
+is quirky by level. Its modes are `get|next|set|dump` — **there is no `walk`**. `-m get` on a
+numeric instance needs no MIB file and cannot be misread, so it goes first; `-m dump` (IBM's
+form, `-md`) prints the readable subtree but resolves the name through the client's MIB files,
+so on a VIOS without them it answers nothing at all rather than failing. `--json` shows which
+form answered — a host that only dumps is visible instead of silently passing.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).

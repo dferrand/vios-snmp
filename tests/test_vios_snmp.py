@@ -63,7 +63,7 @@ class FakeVios(object):
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
                  agent_link="snmpdv3ne", ssw_sticks=True,
-                 dump_empty=False, walk_empty=False):
+                 get_empty=False, dump_empty=False):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
         self.agent_link = agent_link
@@ -72,8 +72,8 @@ class FakeVios(object):
         self.ssw_sticks = ssw_sticks           # False: snmpv3_ssw exits 0 and changes nothing
         self.usage_ssw = ("getopt: Not a recognized flag: l\nUsage: /usr/sbin/snmpv3_ssw "
                           "[-e|-n|-1]")
-        self.dump_empty = dump_empty           # True: `-md` answers nothing at all
-        self.walk_empty = walk_empty           # True: the `-m walk` retry answers nothing too
+        self.get_empty = get_empty             # True: `-m get` answers nothing at all
+        self.dump_empty = dump_empty           # True: `-md` answers nothing either
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -235,18 +235,18 @@ class FakeVios(object):
             # the command is the next line that mentions snmpinfo.
             rest = cmd.split(head, 1)[1].split("\n")[1:]
             line = next((l for l in rest if "snmpinfo" in l), "")
-            walk = "-m walk" in line
-            if key in self.bodies:
+            getform = "-m get" in line
+            if not self.verify_ok:
+                body, rc = fixture("snmpinfo.noresponse.txt"), 1
+            elif key in self.bodies:
                 body, rc = self.bodies[key]
-            elif walk:
-                body, rc = (("", 0) if self.walk_empty else (fixture("snmpinfo.%s.txt" % key), 0))
+            elif getform:
+                body, rc = (("", 0) if self.get_empty else (fixture("snmpinfo.%s.txt" % key), 0))
             elif self.dump_empty and key != "system":
                 # What the real host did: the master answers, the subagent trees do not.
                 body, rc = "", 0
-            elif self.verify_ok:
-                body, rc = fixture("snmpinfo.%s.txt" % key), 0
             else:
-                body, rc = fixture("snmpinfo.noresponse.txt"), 1
+                body, rc = fixture("snmpinfo.%s.txt" % key), 0
             out += [head, body.rstrip("\n"), "__VS_T_%s_rc__=%d" % (key, rc)]
         return "\n".join(out + [""])
 
@@ -478,7 +478,8 @@ class TestModeTest(unittest.TestCase):
         rc, out, _ = run(["--test"], fake)
         self.assertEqual(rc, 0)
         self.assertIn("testing with community 'public'", out)
-        self.assertTrue([c for c in fake.calls if 'snmpinfo -md -v -c "public" system' in c])
+        self.assertTrue([c for c in fake.calls
+                         if 'snmpinfo -m get -c "public" 1.3.6.1.2.1.1.1.0' in c])
 
     def test_no_response_fails_the_test(self):
         fake = healthy(verify_ok=False)
@@ -569,25 +570,34 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok   aixmibd", out)
 
-    def test_hostmibd_asks_for_the_whole_host_resources_subtree(self):
+    def test_hostmibd_gets_a_known_instance_first(self):
         fake = healthy()
-        run(["--test"], fake)
-        cmds = [c for c in fake.calls if "__VS_T_" in c][0]
-        self.assertIn("1.3.6.1.2.1.25", cmds)
-        self.assertNotIn("25.1.1.0", cmds)
+        rc, out, _ = run(["--test", "--json"], fake)
+        self.assertEqual(rc, 0)
+        cmds = dict((r["check"], r["command"]) for r in json.loads(out)["verify"])
+        self.assertIn("1.3.6.1.2.1.25.1.1.0", cmds["hostmibd"])
 
-    def test_an_empty_dump_is_retried_with_a_walk(self):
-        fake = healthy(dump_empty=True)
+    def test_a_failed_get_falls_back_to_the_dump_form(self):
+        # dump resolves names through the client's MIB files and is the form IBM
+        # documents; get needs no MIB. Either one answering is enough.
+        fake = healthy(get_empty=True)
         rc, out, _ = run(["--test", "--json"], fake)
         self.assertEqual(rc, 0, out)
         report = json.loads(out)
         cmds = dict((r["check"], r["command"]) for r in report["verify"])
-        self.assertIn("-m walk", cmds["aixmibd"])
-        self.assertIn("-m walk", cmds["hostmibd"])
-        self.assertIn("-md", cmds["system"])             # the one that answered first time
+        self.assertIn("-md -c", cmds["aixmibd"])
+        self.assertIn("-md -c", cmds["hostmibd"])
 
-    def test_the_hint_names_registration_when_both_forms_are_empty(self):
-        fake = healthy(dump_empty=True, walk_empty=True)
+    def test_no_walk_is_ever_asked_for(self):
+        # This snmpinfo takes get|next|set|dump; `walk` is not a mode.
+        fake = healthy()
+        rc, out, _ = run(["--test", "--json"], fake)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("-m walk", out)
+        self.assertNotIn("-m walk", " ".join(fake.calls))
+
+    def test_the_hint_names_registration_when_every_form_is_empty(self):
+        fake = healthy(get_empty=True, dump_empty=True)
         rc, out, _ = run(["--test"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("FAIL aixmibd", out)
