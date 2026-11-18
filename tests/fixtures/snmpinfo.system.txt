@@ -1,0 +1,6 @@
+sysDescr.0 = "IBM PowerPC CHRP Computer
+Machine Type: 0x0800004c Processor id: 00F8A0A14C00
+Base Operating System Runtime AIX version: 06.01.0009.0100
+TCP/IP Client Support version: 06.01.0009.0100
+VIOS version: 3.1.4.20
+"

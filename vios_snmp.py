@@ -4,6 +4,7 @@ subsystems, the services, and prove it.
 
   vios_snmp.py --host vios1 --community 'CHANGEME'                    # plan only
   vios_snmp.py --host vios1 --community 'CHANGEME' --apply            # write, restart, verify
+  vios_snmp.py --host vios1 --test                                   # snmpinfo checks only
   vios_snmp.py --host vios1                                          # recon: report only
 
 The agent, never the traps: NOTIFY / TARGET_ADDRESS / TARGET_PARAMETERS are
@@ -195,8 +196,23 @@ def verify_cmdargs(v, subs, desired):
     }
 
 
+# snmpinfo prints these and may still exit 0, so the text is part of the verdict.
+SNMP_FAILURES = ("0821-103", "No response", "No Response", "Timeout", "timed out",
+                 "noSuchName", "noSuchObject", "is not running")
+
+
+def snmp_failure(body):
+    """True when an snmpinfo body is an error even though the exit code says 0."""
+    return any(m in body for m in SNMP_FAILURES)
+
+
 def verify(v, community, enabled, cmdargs):
-    """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there."""
+    """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
+
+    Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
+    change. snmpinfo can exit 0 while printing an error, so the text is checked
+    for the failure strings as well as the exit code.
+    """
     q = community or "public"
     subs = [s for s in S.SUBAGENTS if s in enabled]
     tests = [("system", 'snmpinfo -md -v -c "%s" system' % q, "sysDescr")]
@@ -216,11 +232,9 @@ def verify(v, community, enabled, cmdargs):
         mrc = out.split("__VS_T_%s_rc__=" % key, 1)
         body = out.split(head, 1)[1].split("__VS_T_%s_rc__=" % key, 1)[0] if head in out else ""
         code = int(mrc[1].split()[0]) if len(mrc) == 2 and mrc[1].split() else 1
-        ok = code == 0 and bool(body.strip())
+        ok = code == 0 and bool(body.strip()) and not snmp_failure(body)
         if ok and needle:
             ok = needle in body
-        if ok and needle is None:
-            ok = "noSuchName" not in body and "Timeout" not in body
         results.append({"check": key, "command": cmd, "ok": ok, "rc": code,
                         "output": body.strip()[:400]})
     if subs:
@@ -254,6 +268,16 @@ def show_changes(title, changes):
         print("  %s line %d: %s" % (ch.path, ch.line, ch.why))
         for dl in ch.diff().split("\n"):
             print("    " + dl)
+
+
+def show_results(results, only_failures=False):
+    """One line per check; a failure gets its command and what came back."""
+    for r in results:
+        if r["ok"]:
+            if not only_failures:
+                print("  ok   %s" % r["check"])
+        else:
+            print("  FAIL %s: %s\n       %s" % (r["check"], r["command"], r["output"]))
 
 
 def show_cmdargs(changes):
@@ -395,6 +419,8 @@ def main(argv=None):
     ap.add_argument("--no-traps", action="store_true", help="comment out NOTIFY/TARGET_* instead of reporting them")
     ap.add_argument("--apply", action="store_true", help="write the files and (re)start the daemons")
     ap.add_argument("--no-restart", action="store_true", help="write the files and the ODM but leave the daemons alone")
+    ap.add_argument("--test", action="store_true",
+                    help="run the snmpinfo checks and exit; writes nothing")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
     ap.add_argument("--print-config", action="store_true", help="print the files that would be written")
     args = ap.parse_args(argv)
@@ -407,6 +433,8 @@ def main(argv=None):
             raise SystemExit("unknown subsystem(s): %s" % ", ".join(bad))
     if args.apply and not args.community:
         raise SystemExit("--apply needs --community")
+    if args.test and args.apply:
+        raise SystemExit("--test is read-only: --apply already ends with the same checks")
 
     started = time.time()
     try:
@@ -433,6 +461,25 @@ def main(argv=None):
             show_probe(p, args.host, args)
             for f in report["findings"]:
                 print("  %-10s %s" % ("finding", f))
+
+        if args.test:                                # read-only: prove what it answers now
+            # Test with the community the host is configured for unless one is
+            # given, so `--host vios1 --test` is a usable smoke test on its own.
+            comm = args.community or (S.active_communities(p["conf"]) or ["public"])[0]
+            report["community"] = comm
+            if not args.json:
+                print("\ntesting with community '%s' (no writes)" % comm)
+            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled))
+            report["verify"] = results
+            failed = [r for r in results if not r["ok"]]
+            report["ok"] = not failed
+            if not args.json:
+                show_results(results)
+                print("\n%s" % ("all checks passed" if not failed
+                                else "%d of %d checks failed" % (len(failed), len(results))))
+            if args.json:
+                print(json.dumps(report, indent=2))
+            return 0 if not failed else 1
 
         if not args.community:                      # recon only
             if not args.json:
@@ -499,8 +546,7 @@ def main(argv=None):
             if failed:
                 report["ok"] = False
                 if not args.json:
-                    for r in failed:
-                        print("  FAIL %s: %s\n       %s" % (r["check"], r["command"], r["output"]))
+                    show_results(results, only_failures=True)
                 if drift:
                     rollback(v, keep, enabled, restore_files, cmd_restore)
                     log("verification failed: configuration rolled back")
@@ -510,8 +556,7 @@ def main(argv=None):
                     print(json.dumps(report, indent=2))
                 return 1
             if not args.json:
-                for r in results:
-                    print("  ok   %s" % r["check"])
+                show_results(results)
                 print("\napplied and verified in %.1fs" % (time.time() - started))
 
         if args.json:

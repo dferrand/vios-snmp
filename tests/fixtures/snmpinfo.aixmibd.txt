@@ -1,0 +1,5 @@
+aixPageThreshold.0 = 95
+aixPageName.1 = "hd6"
+aixPageNameVG.1 = "rootvg"
+aixPageNamePV.1 = "hdisk0"
+aixPageSize.1 = 1536

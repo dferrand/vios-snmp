@@ -47,11 +47,19 @@ def configured():
     return S.conf_desired(ORIG, community=COMMUNITY)[0], S.rc_desired(RC)[0]
 
 
+def healthy(**kw):
+    """A VIOS that is fully configured and answering: the baseline for the --test mode."""
+    conf, rc_text = configured()
+    fake = FakeVios(conf=conf, rc=rc_text, cmdargs={s: SUBCMD for s in S.SUBAGENTS}, **kw)
+    fake.services = {s: "active" for s in S.SUBSYSTEMS}
+    return fake
+
+
 class FakeVios(object):
     """Answers the scripts vios_snmp.py sends, and keeps the files and the ODM in memory."""
 
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
-                 chssys_sticks=True, ps_hides=False):
+                 chssys_sticks=True, ps_hides=False, bodies=None):
         self.host = "vios1"
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
@@ -60,6 +68,7 @@ class FakeVios(object):
         self.verify_ok = verify_ok
         self.chssys_sticks = chssys_sticks     # False: chssys exits 0 but nothing is stored
         self.ps_hides = ps_hides               # True: processes run without their -c
+        self.bodies = dict(bodies or {})       # {check: (snmpinfo output, rc)} overrides
         self.puts = {}
         self.calls = []
 
@@ -157,16 +166,18 @@ class FakeVios(object):
         return "\n".join(out + [""])
 
     def _verify(self, cmd):
-        body = {"system": 'sysDescr.0 = "IBM PowerPC CHRP Computer"',
-                "aixmibd": "aixPageThreshold.0 = 95",
-                "hostmibd": "1.3.6.1.2.1.25.1.1.0 = 1234567"}
+        """snmpinfo answers with text shaped like the real thing: fixtures, not inline strings."""
         out = []
         for key in ("system", "aixmibd", "hostmibd"):
             if "__VS_T_%s__" % key not in cmd:
                 continue
-            out += ["__VS_T_%s__" % key,
-                    body[key] if self.verify_ok else "snmpinfo: 0821-103 No response.",
-                    "__VS_T_%s_rc__=%d" % (key, 0 if self.verify_ok else 1)]
+            if key in self.bodies:
+                body, rc = self.bodies[key]
+            elif self.verify_ok:
+                body, rc = fixture("snmpinfo.%s.txt" % key), 0
+            else:
+                body, rc = fixture("snmpinfo.noresponse.txt"), 1
+            out += ["__VS_T_%s__" % key, body.rstrip("\n"), "__VS_T_%s_rc__=%d" % (key, rc)]
         return "\n".join(out + [""])
 
 
@@ -368,6 +379,63 @@ class VerifyTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run(["--apply"], fake)
         self.assertEqual(fake.files[S.CONF], ORIG)
+
+
+class TestModeTest(unittest.TestCase):
+    """--test: the snmpinfo checks on their own, with nothing written."""
+
+    def test_a_healthy_host_passes_and_nothing_is_written(self):
+        fake = healthy()
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 0)
+        for check in ("cmdargs", "system", "aixmibd", "hostmibd"):
+            self.assertIn("ok   %s" % check, out)
+        self.assertIn("all checks passed", out)
+        self.assertFalse([c for c in fake.calls
+                          if "cp " in c or "chssys" in c or "startsrc" in c or "stopsrc" in c])
+        self.assertEqual(fake.puts, {})
+
+    def test_without_a_community_it_tests_the_configured_one(self):
+        fake = healthy()
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("testing with community '%s'" % COMMUNITY, out)
+        self.assertTrue([c for c in fake.calls if '-c "%s"' % COMMUNITY in c])
+
+    def test_a_factory_host_is_tested_with_public(self):
+        fake = FakeVios()
+        fake.services = {s: "active" for s in S.SUBSYSTEMS}
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("testing with community 'public'", out)
+        self.assertTrue([c for c in fake.calls if 'snmpinfo -md -v -c "public" system' in c])
+
+    def test_no_response_fails_the_test(self):
+        fake = healthy(verify_ok=False)
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL system", out)
+        self.assertIn("0821-103", out)
+        self.assertIn("3 of 4 checks failed", out)
+
+    def test_nosuchname_fails_even_when_snmpinfo_exits_zero(self):
+        fake = healthy(bodies={"hostmibd": (fixture("snmpinfo.nosuchname.txt"), 0)})
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL hostmibd", out)
+        self.assertIn("1 of 4 checks failed", out)
+
+    def test_json_test_report(self):
+        rc, out, _ = run(["--test", "--json"], healthy())
+        report = json.loads(out)
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["community"], COMMUNITY)
+        self.assertEqual(len(report["verify"]), 4)
+
+    def test_test_and_apply_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            run(["--test", "--apply", "--community", COMMUNITY], healthy())
 
 
 if __name__ == "__main__":

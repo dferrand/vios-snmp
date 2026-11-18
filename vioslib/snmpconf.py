@@ -243,6 +243,11 @@ def conf_desired(text, community=None, managers=None, v3_mibs="included",
     return c.text(), c.changes
 
 
+def active_communities(text):
+    """Community names that an active COMMUNITY line defines, in file order."""
+    return [f[0] for i, d, f in Conf(text).entries("COMMUNITY") if f]
+
+
 def findings(text):
     """Facts about the current file that the plan must report but not change."""
     c = Conf(text)

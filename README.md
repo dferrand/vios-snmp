@@ -28,6 +28,10 @@ tool fixes.
 # plan: print the diff, write nothing (exit 10 when there is drift)
 ./vios_snmp.py --host vios1 --community 'CHANGEME'
 
+# test: the snmpinfo checks only, read-only (exit 1 when a check fails)
+./vios_snmp.py --host vios1 --test
+./vios_snmp.py --host vios1 --test --community 'CHANGEME'
+
 # apply: back up, write, restart the daemons, verify with snmpinfo, roll back on failure
 ./vios_snmp.py --host vios1 --community 'CHANGEME' --apply
 
@@ -35,11 +39,32 @@ tool fixes.
 ./vios_snmp.py --host vios1 --community 'CHANGEME' --manager 10.20.0.10 --manager 10.30.0.0/24 --apply
 ```
 
-Exit codes: `0` in sync (or applied and verified), `10` drift found in plan mode, `1` error.
+Exit codes: `0` in sync (or applied and verified, or every check passed), `10` drift found
+in plan mode, `1` error or a failed check.
 
 Other flags: `--no-restart` (write only), `--no-traps`, `--v3-mibs excluded`,
 `--aix-mibs excluded`, `--enable SUBSYS` (repeatable; default all four), `--print-config`,
 `--json`, `--user`, `--ssh-opt`.
+
+## Testing a host with snmpinfo
+
+`--test` runs the same checks `--apply` ends with, and writes nothing: no backup, no upload,
+no `chssys`, no restart. It is the mode for a host you are only allowed to look at, and for a
+cron job watching an agent that should keep answering.
+
+With no `--community` it tests the community the host is configured for — the first active
+`COMMUNITY` line, else `public` — so `--host vios1 --test` works as-is on a configured VIOS.
+
+| check | command | proves |
+|---|---|---|
+| `cmdargs` | `lssrc -Ss <sub>`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
+| `system` | `snmpinfo -md -v -c <c> system` | the master answers on 161 (`sysDescr`) |
+| `aixmibd` | `snmpinfo -md -c <c> aixpagingspace` | the aixMIB subtree is registered |
+| `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1.1.0` | host resources are registered |
+
+Exit `0` when every check passes, `1` when any fails, with the failing command and what came
+back printed. `snmpinfo` can exit 0 while printing an error, so the output is checked for
+`0821-103`, `No response`, `Timeout` and `noSuchName`/`noSuchObject` as well as the exit code.
 
 ## What it changes
 
