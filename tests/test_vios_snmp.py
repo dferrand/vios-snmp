@@ -35,6 +35,12 @@ ADJUSTED = fixture("snmpdv3.conf.adjusted")
 RC = fixture("rc.tcpip.orig")
 
 COMMUNITY = "CHANGEME"
+
+
+def setUpModule():
+    """A failing apply would otherwise sit in the settle loop for a minute."""
+    T.SETTLE_SECONDS = 1
+    T.SETTLE_PAUSE = 0.2
 SUBCMD = "-c " + COMMUNITY
 
 
@@ -63,10 +69,13 @@ class FakeVios(object):
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
                  agent_link="snmpdv3ne", ssw_sticks=True,
-                 get_empty=False, dump_empty=False,
+                 get_empty=False, dump_empty=False, register_after=0,
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
-                 running_text="    root  4122     1   0 09:00:00      -  0:07 /usr/sbin/snmpdv3ne"):
+                 running_text=("pid=4122\n"
+                               "    root  4122     1   0 09:00:00      -  0:07 /usr/sbin/snmpd\n"
+                               "lrwxrwxrwx    1 root     system   20 Nov 18 09:00 "
+                               "/proc/4122/object/a.out -> /usr/sbin/snmpdv3ne")):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
         self.agent_link = agent_link
@@ -77,6 +86,8 @@ class FakeVios(object):
                           "[-e|-n|-1]")
         self.get_empty = get_empty             # True: `-m get` answers nothing at all
         self.dump_empty = dump_empty           # True: `-md` answers nothing either
+        self.register_after = register_after   # verify rounds in which children are absent
+        self.verify_rounds = 0
         self.listen_text = listen_text         # netstat, for the DPI2 connect question
         self.running_text = running_text       # ps -ef | grep snmpd
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
@@ -112,6 +123,8 @@ class FakeVios(object):
         if "__VS_AGENT__" in cmd:
             return 0, self._probe()
         if "__VS_T_" in cmd:
+            if "__VS_T_system__" in cmd:
+                self.verify_rounds += 1
             return 0, self._verify(cmd)
         if "snmpv3_ssw" in cmd:
             # Real flags on VIOS 4.1: -e, -n, -1. There is no -l.
@@ -250,7 +263,11 @@ class FakeVios(object):
             rest = cmd.split(head, 1)[1].split("\n")[1:]
             line = next((l for l in rest if "snmpinfo" in l), "")
             getform = "-m get" in line
-            if not self.verify_ok:
+            if self.verify_rounds <= self.register_after and key in S.SUBAGENTS:
+                # A child that could not connect at start keeps trying: for a while
+                # the master answers noSuchName for its subtree.
+                body, rc = "noSuchName at position 1", 0
+            elif not self.verify_ok:
                 body, rc = fixture("snmpinfo.noresponse.txt"), 1
             elif key in self.bodies:
                 body, rc = self.bodies[key]
@@ -669,6 +686,15 @@ class RestartTest(unittest.TestCase):
         self.assertEqual(fake.files[S.CONF], ORIG)
         self.assertEqual(fake.puts, {})
 
+    def test_restart_waits_for_a_child_that_registers_late(self):
+        fake = healthy(register_after=1)
+        with unittest.mock.patch.object(T, "SETTLE_PAUSE", 0):
+            rc, out, err = run(["--restart"], fake)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("restarted and verified", out)
+        self.assertIn("waiting for the subagents to register", err)
+        self.assertEqual(fake.verify_rounds, 2)
+
     def test_restart_can_bounce_one_child_and_leave_the_master_up(self):
         fake = healthy()
         rc, out, _ = run(["--restart", "--enable", "aixmibd"], fake)
@@ -730,7 +756,10 @@ class AgentLinkTest(unittest.TestCase):
         rc, out, _ = run([], FakeVios())
         self.assertEqual(rc, 0)
         self.assertIn("listen     tcp4", out)
-        self.assertIn("/usr/sbin/snmpdv3ne", out.split("running")[1].split("\n")[0])
+        running = out.split("running")[1].split("\n")[0]
+        self.assertIn("4122", running)
+        self.assertIn("/usr/sbin/snmpdv3ne", running)      # from /proc, not argv[0]
+        self.assertIn("since 09:00:00", running)
 
     def test_the_probe_never_asks_snmpv3_ssw_for_l(self):
         # VIOS 4.1 / AIX 7 accept -e, -n and -1 only; -l prints the usage text.

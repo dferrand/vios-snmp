@@ -190,6 +190,24 @@ A second apply on an unchanged VIOS issues no writes, no `chssys` and no
 `stopsrc`/`startsrc`: the diff is empty, so there is nothing to do. That is tested, as is
 a host whose files are already right and whose ODM is not.
 
+## Reading the header
+
+```
+  agent      /usr/sbin/snmpdv3ne
+  services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
+  listen     tcp4 0 0 *.161 *.* LISTEN udp4 0 0 *.161 *.*
+  running    20316534 /usr/sbin/snmpdv3ne since 13:44:26
+```
+
+`listen` comes from `netstat -an` (`-a` matters: without it AIX lists only connected sockets,
+never the listening one), and `running` resolves the live process through
+`/proc/<pid>/object/a.out` — `ps` shows `argv[0]`, i.e. `/usr/sbin/snmpd`, whatever the link
+says, so it cannot tell you which agent is actually running.
+
+Those two lines are what a child's `1473-665 Connect to SNMP agent failed` is about: the agent
+has to be listening on a socket the child can reach, and the process has to be the agent the
+link points at.
+
 ## Report-only findings
 
 Each run prints what it noticed but did not change: trap directives left in place, a

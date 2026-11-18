@@ -116,6 +116,22 @@ def agent_state(agent):
                    % (agent, SWITCH_CMD, name, S.CONF_V1))
 
 
+def parse_running(raw):
+    """{pid, exe, since} for the running snmpd: ps gives argv[0], /proc the real file."""
+    out = {"pid": "", "exe": "", "since": "", "raw": " ".join(raw.split())}
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("pid="):
+            out["pid"] = s[4:].strip()
+        elif " -> " in s and "/proc/" in s:
+            out["exe"] = s.split(" -> ", 1)[1].strip()
+        elif "/usr/sbin/snmpd" in s:
+            f = s.split()
+            if len(f) >= 5:
+                out["since"] = f[4]
+    return out
+
+
 def cmdargs_script(subs):
     """Far-side reads of the SRC subsystem object, one block per subagent.
 
@@ -158,9 +174,14 @@ def probe(v):
         "echo __VS_AGENT__",
         "ls -l /usr/sbin/snmpd 2>&1",
         "echo __VS_LISTEN__",
-        "netstat -An 2>/dev/null | grep '[.]161 ' | head -5",
+        # -a is what lists listening sockets; without it AIX shows only connected ones.
+        "netstat -an 2>/dev/null | grep '[.]161 ' | head -5",
         "echo __VS_RUNNING__",
-        "ps -ef | grep '[s]nmpd' | head -3",
+        "p=`ps -ef | grep '[s]nmpd' | awk '{print $2}' | head -1`",
+        "echo \"pid=$p\"",
+        "ps -ef | grep '[s]nmpd' | head -1",
+        # argv[0] is /usr/sbin/snmpd whatever the link says; /proc knows the real file.
+        "ls -l /proc/$p/object/a.out 2>&1",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
         "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
@@ -186,7 +207,7 @@ def probe(v):
     # Where the agent listens and which binary is actually running: a DPI2 child
     # that cannot connect (1473-665 in its log) is explained by one of these.
     listen = " ".join(block("__VS_LISTEN__", "__VS_RUNNING__").split())
-    running = " ".join(block("__VS_RUNNING__", "__VS_BOOTUP__").split())
+    running = parse_running(block("__VS_RUNNING__", "__VS_BOOTUP__"))
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -396,6 +417,28 @@ def answered(pair):
     return code == 0 and bool(body) and not snmp_failure(body)
 
 
+# A DPI2 child that could not connect at start "keeps trying", so a subtree can
+# appear a few seconds after the restart: give it that time before failing.
+SETTLE_SECONDS = 60
+SETTLE_PAUSE = 10
+
+
+def verify_settled(v, community, enabled, cmdargs, agent=""):
+    """verify(), then wait for subagent subtrees to show up."""
+    results = verify(v, community, enabled, cmdargs, agent)
+    deadline = time.time() + SETTLE_SECONDS
+    waiting = False
+    while time.time() < deadline and any(not r["ok"] for r in results
+                                         if r["check"] in S.SUBAGENTS):
+        if not waiting:
+            log("waiting for the subagents to register (a child that could not connect "
+                "keeps trying)")
+            waiting = True
+        time.sleep(SETTLE_PAUSE)
+        results = verify(v, community, enabled, cmdargs, agent)
+    return results
+
+
 def subagent_hint(body, sub, siblings_ok=False):
     """Why a subagent can run with the right community and still serve nothing."""
     if "No response" in body or "Timeout" in body or "0821-103" in body:
@@ -506,8 +549,10 @@ def show_probe(p, host, args):
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
     if p.get("listen"):
         print("  %-10s %s" % ("listen", p["listen"]))
-    if p.get("running"):
-        print("  %-10s %s" % ("running", p["running"]))
+    run = p.get("running") or {}
+    if run.get("pid") or run.get("exe"):
+        print("  %-10s %s %s%s" % ("running", run.get("pid", "?"), run.get("exe") or "(exe unknown)",
+                                   " since %s" % run["since"] if run.get("since") else ""))
     auto = S.rc_autostart(p["rc_tcpip"])
     print("  %-10s %s" % ("at boot", ", ".join("%s %s" % (s, "yes" if auto[s] else "no") for s in S.SUBSYSTEMS)))
     print("  %-10s %s" % ("mibd args", ", ".join("%s %s" % (s, p["cmdargs"].get(s) or "(none)")
@@ -798,7 +843,7 @@ def main(argv=None):
                     print("\nbouncing %s, master left running (no writes)"
                           % (", ".join(subs) or "nothing"))
                 bounce_subsystems(v, subs)
-            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
+            results = verify_settled(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             report["ok"] = not failed
@@ -881,7 +926,7 @@ def main(argv=None):
             if not args.json:
                 print("\napplied to %s; daemons left alone (--no-restart)" % args.host)
         else:
-            results = verify(v, args.community, enabled, cmdargs, p["agent"])
+            results = verify_settled(v, args.community, enabled, cmdargs, p["agent"])
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             if failed:
