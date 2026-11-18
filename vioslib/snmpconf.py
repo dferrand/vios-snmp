@@ -23,6 +23,8 @@ import shlex
 
 CONF = "/etc/snmpdv3.conf"
 RC_TCPIP = "/etc/rc.tcpip"
+# Only the old v1 agent reads this; it is named so the report can say so.
+CONF_V1 = "/etc/snmpd.conf"
 
 # Upper-case directives, i.e. the ones this tool reasons about. The lower-case
 # entries (logging, smux) are left untouched and are not modelled.

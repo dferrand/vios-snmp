@@ -65,7 +65,10 @@ With no `--community` it tests the community the host is configured for — the 
 
 AIX links it relatively (`snmpd -> snmpdv3ne`), so the target is resolved against
 `/usr/sbin` and compared as a path, not as text. `snmpdv3e` — the encrypted agent — passes
-with a note about the `snmp.crypto` fileset (`snmpv3_ssw -l` is printed as `ssw`).
+with a note that it needs the `snmp.crypto` fileset installed.
+
+`snmpv3_ssw` on VIOS 4.1 / AIX 7 takes `-e`, `-n` and `-1` only (there is no `-l`), so the
+current mode is read from the link itself rather than asked of the switch.
 
 Any other target is a plan item, repaired the supported way rather than by hand:
 
@@ -77,9 +80,10 @@ agent link  (1 change)
 
 `--apply` runs `snmpv3_ssw -n` first — before the files and before the daemons come back —
 then re-reads the link and aborts if it still points elsewhere. `--test` never switches it;
-it just fails the `agent` check. A switch is not undone by a rollback: `snmpv3_ssw` only
-knows the two v3 agents, so an arbitrary previous target cannot be restored, and the
-rollback says so.
+it just fails the `agent` check. If verification then fails, a rollback switches the link
+back with the matching flag (`-1` for `snmpdv1`, `-e` for `snmpdv3e`); a target `snmpv3_ssw`
+cannot select (a hand-made link to something else) is left at `snmpdv3ne`, and the rollback
+says so.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).

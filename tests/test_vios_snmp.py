@@ -62,15 +62,15 @@ class FakeVios(object):
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
-                 agent_link="snmpdv3ne", ssw_text="SNMP V3 encryption is disabled.",
-                 ssw_sticks=True):
+                 agent_link="snmpdv3ne", ssw_sticks=True):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
         self.agent_link = agent_link
         self.agent_line = ("lrwxrwxrwx    1 root     system            9 Oct 06 12:59 "
                            "/usr/sbin/snmpd -> %s" % agent_link)
-        self.ssw_text = ssw_text
-        self.ssw_sticks = ssw_sticks           # False: snmpv3_ssw -n exits 0 and changes nothing
+        self.ssw_sticks = ssw_sticks           # False: snmpv3_ssw exits 0 and changes nothing
+        self.usage_ssw = ("getopt: Not a recognized flag: l\nUsage: /usr/sbin/snmpv3_ssw "
+                          "[-e|-n|-1]")
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -105,14 +105,15 @@ class FakeVios(object):
             return 0, self._probe()
         if "__VS_T_" in cmd:
             return 0, self._verify(cmd)
-        if "snmpv3_ssw -n" in cmd:
-            if self.ssw_sticks:
-                self.agent_link = "snmpdv3ne"
+        if "snmpv3_ssw" in cmd:
+            # Real flags on VIOS 4.1: -e, -n, -1. There is no -l.
+            m = re.search(r"snmpv3_ssw\s+(-[en1])\b", cmd)
+            target = {"-n": "snmpdv3ne", "-e": "snmpdv3e", "-1": "snmpdv1"}.get(m.group(1) if m else "")
+            if target and self.ssw_sticks:
+                self.agent_link = target
                 self.agent_line = ("lrwxrwxrwx    1 root     system            9 Oct 06 12:59 "
-                                   "/usr/sbin/snmpd -> snmpdv3ne")
-            return 0, ""
-        if "snmpv3_ssw -l" in cmd:
-            return 0, self.ssw_text
+                                   "/usr/sbin/snmpd -> %s" % target)
+            return 0, self.usage_ssw if " -l" in cmd else ""
         if "ls -l /usr/sbin/snmpd" in cmd:
             return 0, self.agent_line
         if "chssys" in cmd:
@@ -171,7 +172,6 @@ class FakeVios(object):
 
     def _probe(self):
         out = ["__VS_AGENT__", self.agent_line,
-               "__VS_SSW__", self.ssw_text,
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -603,6 +603,26 @@ class AgentLinkTest(unittest.TestCase):
         rc, out, _ = run([], FakeVios())
         self.assertEqual(rc, 0)
         self.assertIn("agent      /usr/sbin/snmpdv3ne", out)
+
+    def test_the_v1_agent_message_names_its_own_config(self):
+        ok, msg = T.agent_state("/usr/sbin/snmpdv1")
+        self.assertFalse(ok)
+        self.assertIn("/etc/snmpd.conf", msg)
+        self.assertIn("has no effect", msg)
+
+    def test_the_probe_never_asks_snmpv3_ssw_for_l(self):
+        # VIOS 4.1 / AIX 7 accept -e, -n and -1 only; -l prints the usage text.
+        fake = healthy()
+        run([], fake)
+        self.assertFalse([c for c in fake.calls if "snmpv3_ssw" in c and " -l" in c])
+
+    def test_a_failed_verification_puts_the_previous_agent_back(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1", verify_ok=False)
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(fake.agent_link, "snmpdv1")
+        self.assertIn("back at /usr/sbin/snmpdv1", err)
+        self.assertIn("snmpv3_ssw -1", " ".join(fake.calls))
 
     def test_test_mode_fails_on_the_wrong_agent(self):
         fake = healthy(agent_link="/usr/sbin/snmpdv1")
