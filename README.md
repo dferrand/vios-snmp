@@ -35,6 +35,9 @@ tool fixes.
 # restart: bounce the four daemons in order and check them, write nothing
 ./vios_snmp.py --host vios1 --restart
 
+# reset-boots: the agent initialised from an address this host no longer has
+./vios_snmp.py --host vios1 --reset-boots
+
 # apply: back up, write, restart the daemons, verify with snmpinfo, roll back on failure
 ./vios_snmp.py --host vios1 --community 'CHANGEME' --apply
 
@@ -45,7 +48,8 @@ tool fixes.
 Exit codes: `0` in sync (or applied and verified, or every check passed), `10` drift found
 in plan mode, `1` error or a failed check.
 
-Other flags: `--restart` (bounce and verify), `--no-restart` (write only), `--no-traps`,
+Other flags: `--restart` (bounce and verify), `--reset-boots` (rebuild the agent's boots
+file), `--no-restart` (write only), `--no-traps`,
 `--v3-mibs excluded`,
 `--aix-mibs excluded`, `--enable SUBSYS` (repeatable; default all four), `--print-config`,
 `--json`, `--user`, `--ssh-opt`.
@@ -195,9 +199,21 @@ a host whose files are already right and whose ODM is not.
 ```
   agent      /usr/sbin/snmpdv3ne
   services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
+  agent ip   172.16.7.154  (not an address this host has: 10.17.10.21)
   listen     tcp4 0 0 *.161 *.* LISTEN udp4 0 0 *.161 *.*
   running    20316534 /usr/sbin/snmpdv3ne since 13:44:26
 ```
+
+`agent ip` is the address the agent says it initialised from, out of its own log
+(`/var/tmp/snmpdv3.log`, `Agent using IP address UDP …`). When it is not one of the host's own
+addresses, `/etc/snmpd.boots` is stale — it caches the address the agent was first set up with,
+and the log says `Using existing file /etc/snmpd.boots`. A DPI2 child connects to the agent on
+that address, so a stale one leaves the child unable to connect (`1473-665 Connect to SNMP agent
+failed`) while external clients still get answers from the real address.
+
+`--reset-boots` moves the file aside to `/etc/snmpd.boots.bak.<timestamp>` — never deleted — and
+restarts the four daemons in order, so the agent rebuilds it from a current address. With v3
+users this invalidates their localized keys, which is why the old file is kept.
 
 `listen` comes from `netstat -an` (`-a` matters: without it AIX lists only connected sockets,
 never the listening one), and `running` resolves the live process through

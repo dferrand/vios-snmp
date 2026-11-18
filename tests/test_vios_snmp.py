@@ -70,6 +70,7 @@ class FakeVios(object):
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
                  agent_link="snmpdv3ne", ssw_sticks=True,
                  get_empty=False, dump_empty=False, register_after=0,
+                 agent_ip="10.17.10.21", local_ips=("10.17.10.21",), boots_present=True,
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
                  running_text=("pid=4122\n"
@@ -86,6 +87,9 @@ class FakeVios(object):
                           "[-e|-n|-1]")
         self.get_empty = get_empty             # True: `-m get` answers nothing at all
         self.dump_empty = dump_empty           # True: `-md` answers nothing either
+        self.agent_ip = agent_ip               # what /var/tmp/snmpdv3.log says it initialised from
+        self.local_ips = list(local_ips)
+        self.boots_present = boots_present     # /etc/snmpd.boots exists
         self.register_after = register_after   # verify rounds in which children are absent
         self.verify_rounds = 0
         self.listen_text = listen_text         # netstat, for the DPI2 connect question
@@ -126,6 +130,13 @@ class FakeVios(object):
             if "__VS_T_system__" in cmd:
                 self.verify_rounds += 1
             return 0, self._verify(cmd)
+        if "snmpd.boots" in cmd and "mv" in cmd:
+            if not self.boots_present:
+                return 0, "__absent__"
+            self.boots_present = False
+            if self.local_ips:
+                self.agent_ip = self.local_ips[0]      # the agent rebuilds it from this address
+            return 0, "__moved__"
         if "snmpv3_ssw" in cmd:
             # Real flags on VIOS 4.1: -e, -n, -1. There is no -l.
             m = re.search(r"snmpv3_ssw\s+(-[en1])\b", cmd)
@@ -188,6 +199,11 @@ class FakeVios(object):
         out = ["__VS_AGENT__", self.agent_line,
                "__VS_LISTEN__", self.listen_text,
                "__VS_RUNNING__", self.running_text,
+               "__VS_AGENTIP__", (" 11/18/26 02:04:31 PM -  s_agv123.c(1117) Agent using IP "
+                                  "address UDP %s port 0" % self.agent_ip),
+               "__VS_LOCALIP__",
+               "\n".join("        inet %s netmask 0xffffff00 broadcast 10.0.0.255" % ip
+                         for ip in self.local_ips),
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -751,6 +767,35 @@ class AgentLinkTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("/etc/snmpd.conf", msg)
         self.assertIn("has no effect", msg)
+
+    def test_recon_flags_an_agent_initialised_from_a_foreign_address(self):
+        # The stale-boots signature: the agent's log names an address this host
+        # does not have, so a DPI2 child connecting there cannot reach it.
+        fake = healthy(agent_ip="172.16.7.154")
+        rc, out, _ = run([], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("172.16.7.154", out)
+        self.assertIn("not an address this host has", out)
+        self.assertIn("--reset-boots", out)
+
+    def test_a_local_agent_address_raises_nothing(self):
+        rc, out, _ = run([], healthy())
+        self.assertEqual(rc, 0)
+        self.assertNotIn("--reset-boots", out)
+
+    def test_reset_boots_moves_the_file_and_restarts(self):
+        fake = healthy(agent_ip="172.16.7.154")
+        rc, out, err = run(["--reset-boots"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("/etc/snmpd.boots moved aside", out)
+        self.assertIn("reset and verified", out)
+        self.assertFalse(fake.boots_present)
+        self.assertEqual(fake.agent_ip, "10.17.10.21")
+        self.assertIn("stopsrc -s snmpd", " ".join(fake.calls))
+
+    def test_reset_boots_stands_on_its_own(self):
+        with self.assertRaises(SystemExit):
+            run(["--reset-boots", "--restart"], healthy())
 
     def test_recon_shows_the_listener_and_the_running_agent(self):
         rc, out, _ = run([], FakeVios())

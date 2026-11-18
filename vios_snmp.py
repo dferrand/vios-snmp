@@ -29,6 +29,7 @@ Exit codes: 0 in sync (or applied and verified), 10 drift found in plan mode,
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -116,6 +117,17 @@ def agent_state(agent):
                    % (agent, SWITCH_CMD, name, S.CONF_V1))
 
 
+def logged_agent_ip(raw):
+    """The address the agent initialised from, out of its own log line."""
+    m = re.search(r"UDP\s+(\d+\.\d+\.\d+\.\d+)", raw)
+    return m.group(1) if m else ""
+
+
+def local_addresses(raw):
+    """Every IPv4 address this host has configured."""
+    return sorted(set(re.findall(r"inet\s+(\d+\.\d+\.\d+\.\d+)", raw)))
+
+
 def parse_running(raw):
     """{pid, exe, since} for the running snmpd: ps gives argv[0], /proc the real file."""
     out = {"pid": "", "exe": "", "since": "", "raw": " ".join(raw.split())}
@@ -182,6 +194,11 @@ def probe(v):
         "ps -ef | grep '[s]nmpd' | head -1",
         # argv[0] is /usr/sbin/snmpd whatever the link says; /proc knows the real file.
         "ls -l /proc/$p/object/a.out 2>&1",
+        "echo __VS_AGENTIP__",
+        # The agent logs the address it initialised from: the boots file caches it.
+        "grep 'Agent using IP address' /var/tmp/snmpdv3.log 2>/dev/null | tail -1",
+        "echo __VS_LOCALIP__",
+        "ifconfig -a 2>/dev/null | grep 'inet ' | head -8",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
         "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
@@ -208,6 +225,8 @@ def probe(v):
     # that cannot connect (1473-665 in its log) is explained by one of these.
     listen = " ".join(block("__VS_LISTEN__", "__VS_RUNNING__").split())
     running = parse_running(block("__VS_RUNNING__", "__VS_BOOTUP__"))
+    agent_ip = logged_agent_ip(block("__VS_AGENTIP__", "__VS_LOCALIP__"))
+    local_ips = local_addresses(block("__VS_LOCALIP__", "__VS_BOOTUP__"))
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -229,6 +248,8 @@ def probe(v):
         "agent_raw": agent_line,
         "listen": listen,
         "running": running,
+        "agent_ip": agent_ip,
+        "local_ips": local_ips,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -277,6 +298,21 @@ def run_services(v, enabled, stop=False):
     if rc != 0 or "0513-" in out:
         raise V.Abort("starting the SNMP daemons failed: %s" % out.strip()[-600:])
     return out
+
+
+def reset_boots(v):
+    """Move /etc/snmpd.boots aside so the agent rebuilds it from the current address.
+
+    Never deleted: the old file stays as /etc/snmpd.boots.bak.<timestamp>, which is
+    also what a v3 user's localized keys would have to come from.
+    """
+    ts = time.strftime("%Y%m%d%H%M%S")
+    rc, out = v.root("if [ -f /etc/snmpd.boots ]; then mv /etc/snmpd.boots "
+                     "/etc/snmpd.boots.bak.%s && echo __moved__; else echo __absent__; fi"
+                     % ts, timeout=60)
+    if rc != 0 or ("__moved__" not in out and "__absent__" not in out):
+        raise V.Abort("cannot move /etc/snmpd.boots aside: %s" % out.strip()[-400:])
+    return "__moved__" in out
 
 
 def bounce_subsystems(v, subs):
@@ -547,6 +583,11 @@ def show_probe(p, host, args):
     print("%s  (VIOS %s)" % (host, p["level"]))
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
+    if p.get("agent_ip"):
+        stale = p.get("local_ips") and p["agent_ip"] not in p["local_ips"]
+        print("  %-10s %s%s" % ("agent ip", p["agent_ip"],
+                                "  (not an address this host has: %s)"
+                                % ", ".join(p["local_ips"]) if stale else ""))
     if p.get("listen"):
         print("  %-10s %s" % ("listen", p["listen"]))
     run = p.get("running") or {}
@@ -571,6 +612,20 @@ def show_changes(title, changes):
         print("  %s line %d: %s" % (ch.path, ch.line, ch.why))
         for dl in ch.diff().split("\n"):
             print("    " + dl)
+
+
+def finish_verify(report, results, args, done):
+    """Record and print a verify run; returns the exit code."""
+    report["verify"] = results
+    failed = [r for r in results if not r["ok"]]
+    report["ok"] = not failed
+    if not args.json:
+        show_results(results)
+        print("\n%s" % (done if not failed
+                        else "%d of %d checks still fail" % (len(failed), len(results))))
+    if args.json:
+        print(json.dumps(report, indent=2))
+    return 0 if not failed else 1
 
 
 def show_results(results, only_failures=False):
@@ -751,6 +806,9 @@ def main(argv=None):
     ap.add_argument("--no-restart", action="store_true", help="write the files and the ODM but leave the daemons alone")
     ap.add_argument("--test", action="store_true",
                     help="run the snmpinfo checks and exit; writes nothing")
+    ap.add_argument("--reset-boots", action="store_true",
+                    help="move /etc/snmpd.boots aside, restart in order and verify; "
+                         "for an agent initialised from a stale address")
     ap.add_argument("--restart", action="store_true",
                     help="bounce the four daemons in order and verify; writes nothing "
                          "(--enable without snmpd bounces just those children)")
@@ -771,6 +829,9 @@ def main(argv=None):
     if args.restart and (args.apply or args.test):
         raise SystemExit("--restart stands on its own: it writes nothing, --apply and --test "
                          "do their own restarts or none")
+    if args.reset_boots and (args.apply or args.test or args.restart):
+        raise SystemExit("--reset-boots stands on its own: it moves the boots file aside, "
+                         "restarts, and verifies")
 
     started = time.time()
     try:
@@ -798,6 +859,12 @@ def main(argv=None):
         link_fix = not agent_ok
         if agent_msg:
             report["findings"].insert(0, agent_msg)
+        if p.get("agent_ip") and p.get("local_ips") and p["agent_ip"] not in p["local_ips"]:
+            report["findings"].insert(0,
+                                      "the agent initialised from %s, which is not an address this "
+                                      "host has: /etc/snmpd.boots is stale, and a DPI2 child that "
+                                      "connects there cannot reach it. --reset-boots moves the file "
+                                      "aside and restarts" % p["agent_ip"])
         if link_fix:
             report["agent_change"] = {"file": "/usr/sbin/snmpd", "before": p["agent"],
                                       "after": "/usr/sbin/snmpdv3ne", "command": SWITCH_CMD}
@@ -827,6 +894,19 @@ def main(argv=None):
                 print(json.dumps(report, indent=2))
             return 0 if not failed else 1
 
+        if args.reset_boots:                         # rebuild the agent's boots file
+            comm = args.community or (S.active_communities(p["conf"]) or ["public"])[0]
+            report["community"] = comm
+            moved = reset_boots(v)
+            if not args.json:
+                print("\n/etc/snmpd.boots %s; restarting the four daemons in order"
+                      % ("moved aside" if moved else "was not there"))
+            run_services(v, enabled, stop=True)
+            return finish_verify(report, verify_settled(v, comm, enabled,
+                                                        S.cmdargs_desired(comm, enabled),
+                                                        p["agent"]),
+                                 args, "reset and verified")
+
         if args.restart:                             # bounce the daemons, then check them
             # The cure for stale DPI2 registration: the children only bind to the
             # master that was running when they started, so the order matters.
@@ -843,17 +923,10 @@ def main(argv=None):
                     print("\nbouncing %s, master left running (no writes)"
                           % (", ".join(subs) or "nothing"))
                 bounce_subsystems(v, subs)
-            results = verify_settled(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
-            report["verify"] = results
-            failed = [r for r in results if not r["ok"]]
-            report["ok"] = not failed
-            if not args.json:
-                show_results(results)
-                print("\n%s" % ("restarted and verified" if not failed
-                                else "%d of %d checks still fail" % (len(failed), len(results))))
-            if args.json:
-                print(json.dumps(report, indent=2))
-            return 0 if not failed else 1
+            return finish_verify(report, verify_settled(v, comm, enabled,
+                                                        S.cmdargs_desired(comm, enabled),
+                                                        p["agent"]),
+                                 args, "restarted and verified")
 
         if not args.community:                      # recon only
             if not args.json:
