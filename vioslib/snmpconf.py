@@ -343,11 +343,19 @@ def rc_autostart(text):
 # line. That argument belongs in the SRC subsystem object (ODM), set with
 # chssys, not in rc.tcpip: rc.tcpip starts them with `startsrc -s <cmd> -a "$3"`
 # and startsrc *appends* -a to the cmdargs from the ODM, so a plain start line
-# leaves the chssys value in force. IBM technote 884646 does it this way and
-# checks the result with `ps -ef | grep mibd` and `lssrc -Ss <sub>`.
+# leaves the chssys value in force. IBM technote 884646 does it this way.
+#
+# Read the value back with odmget, not with lssrc -Ss: odmget prints the stanza
+# as `attribute = "value"` lines, so the value arrives quoted and intact, while
+# lssrc renders a colon-separated row whose third field shifts as soon as the
+# cmdargs contain a colon. lssrc stays as the fallback for a host where the
+# odmget read comes back empty.
 #
 # An empty cmdargs means "use public", which is also how the technote undoes
 # the change (`chssys -s aixmibd -a ""`).
+
+ODM_QUERY = "odmget -q subsysname=%s SRCsubsys"
+
 
 def cmdargs_desired(community, enabled=SUBSYSTEMS):
     """{subsystem: cmdargs} for the subagents; snmpd takes its community from snmpdv3.conf."""
@@ -360,11 +368,30 @@ def cmdargs_desired(community, enabled=SUBSYSTEMS):
     return out
 
 
-def cmdargs_parse(text):
+def cmdargs_from_odm(text):
+    """cmdargs from `odmget -q subsysname=<sub> SRCsubsys`; None when the stanza has none.
+
+    odmget prints one `attribute = "value"` line per field, so the value arrives
+    quoted and intact — that is why it is the source of truth here.
+    """
+    found = None
+    for line in text.splitlines():
+        s = line.strip()
+        if " = " not in s:
+            continue
+        key, value = [p.strip() for p in s.split(" = ", 1)]
+        if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        if key == "cmdargs":
+            found = value
+    return found
+
+
+def cmdargs_from_lssrc(text):
     """cmdargs from one `lssrc -Ss <sub>` row: the third colon-separated field.
 
-    The row is `subsysname:synonym:cmdargs:path:...`; the header line starts
-    with '#' and is skipped. Missing or blank means "no cmdargs", i.e. public.
+    The row is `subsysname:synonym:cmdargs:path:...`; the header line starts with
+    '#' and is skipped. Fallback only: a colon inside the cmdargs shifts the fields.
     """
     for line in text.splitlines():
         line = line.strip()
@@ -372,16 +399,29 @@ def cmdargs_parse(text):
             continue
         fields = line.split(":")
         if len(fields) >= 3:
-            return fields[2].strip()
+            return fields[2].strip().strip("\"'")
     return ""
 
 
+def cmdargs_norm(args):
+    """Comparison form: whitespace collapsed and wrapping quotes dropped.
+
+    The ODM keeps whatever chssys was given, so a value that differs only in
+    spacing is the same value. Comparing raw text makes the tool rewrite it on
+    every run.
+    """
+    s = (args or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1]
+    return " ".join(s.split())
+
+
 def cmdargs_changes(current, desired):
-    """[(subsystem, before, after)] for the subagents whose cmdargs differ."""
+    """[(subsystem, before, after)] for the subagents whose cmdargs really differ."""
     out = []
     for sub in sorted(desired):
         before = (current.get(sub) or "").strip()
-        if before != desired[sub]:
+        if cmdargs_norm(before) != cmdargs_norm(desired[sub]):
             out.append((sub, before, desired[sub]))
     return out
 

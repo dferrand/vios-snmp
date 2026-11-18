@@ -51,19 +51,48 @@ def log(msg):
 
 # ------------------------------------------------------------------- far side
 
+def _between(text, start, ends):
+    """The text after `start`, up to the earliest of `ends` (or the end of the text)."""
+    a = text.find(start)
+    if a < 0:
+        return ""
+    a += len(start)
+    stops = [text.find(e, a) for e in ends]
+    stops = [s for s in stops if s >= 0]
+    return text[a:min(stops)] if stops else text[a:]
+
+
+def cmdargs_script(subs):
+    """Far-side reads of the SRC subsystem object, one block per subagent.
+
+    odmget is the source of truth (quoted `attribute = "value"` lines, so the
+    value arrives intact); the lssrc row is printed right after it as a fallback
+    for a host where odmget returns nothing.
+    """
+    lines = []
+    for sub in subs:
+        lines += ['echo "__VS_CMD__%s"' % sub, "%s 2>&1" % (S.ODM_QUERY % sub),
+                  'echo "__VS_LSSRC__%s"' % sub, "lssrc -Ss %s 2>&1 | tail -1" % sub]
+    return "\n".join(lines)
+
+
 def cmdargs_block(out, subs):
-    """{subsystem: cmdargs} from the __VS_CMD__<sub> blocks of a probe script."""
+    """{subsystem: cmdargs} from the __VS_CMD__ / __VS_LSSRC__ blocks of a probe script."""
     res = {}
     for sub in subs:
-        m = out.split("__VS_CMD__" + sub, 1)
-        res[sub] = S.cmdargs_parse(m[1].strip().split("\n")[0]) if len(m) == 2 else ""
+        odm = _between(out, "__VS_CMD__" + sub, ("__VS_LSSRC__" + sub,))
+        got = S.cmdargs_from_odm(odm)
+        if got is None:
+            got = S.cmdargs_from_lssrc(
+                _between(out, "__VS_LSSRC__" + sub,
+                         ("__VS_CMD__", "__VS_CONF__", "__VS_RC__", "__VS_PS__", "__VS_END__")))
+        res[sub] = got
     return res
 
 
 def read_cmdargs(v, subs):
     """The cmdargs stored in the SRC subsystem object: what the next start will use."""
-    script = "\n".join('echo "__VS_CMD__%s"\nlssrc -Ss %s 2>&1 | tail -1' % (s, s) for s in subs)
-    rc, out = v.root(script, timeout=PROBE_TIMEOUT)
+    rc, out = v.root(cmdargs_script(subs), timeout=PROBE_TIMEOUT)
     if rc != 0:
         raise V.Abort("%s: cannot read the SRC cmdargs: %s" % (v.host, out.strip()[-400:]))
     return cmdargs_block(out, subs)
@@ -79,7 +108,7 @@ def probe(v):
         "for s in %s; do echo \\\"__VS_SVC__$s\\\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
         "echo __VS_SVC__dpid2",
         "lssrc -s dpid2 2>&1 | tail -1",
-        "for s in %s; do echo \\\"__VS_CMD__$s\\\"; lssrc -Ss $s 2>&1 | tail -1; done" % " ".join(S.SUBAGENTS),
+        cmdargs_script(S.SUBAGENTS),
         "echo __VS_CONF__",
         "cat %s" % CONF,
         "echo __VS_RC__",
@@ -164,11 +193,10 @@ def verify_cmdargs(v, subs, desired):
 
     Neither half alone proves it. The ODM says what the *next* start will use, so
     it is what a reboot gets; the process says what this boot actually loaded. The
-    technote checks both, with `ps -ef | grep mibd` and `lssrc -Ss`.
+    technote checks both, with ps and the ODM stanza; the ODM is read with odmget,
+    whose quoted `attribute = "value"` lines cannot be shifted by the value itself.
     """
-    lines = ["echo __VS_PS__", "ps -ef | grep '[m]ibd'"]
-    for sub in subs:
-        lines += ['echo "__VS_CMD__%s"' % sub, "lssrc -Ss %s 2>&1 | tail -1" % sub]
+    lines = ["echo __VS_PS__", "ps -ef | grep '[m]ibd'", cmdargs_script(subs)]
     rc, out = v.root("\n".join(lines), timeout=PROBE_TIMEOUT)
     ps = out.split("__VS_CMD__")[0]
     ps = ps.split("__VS_PS__", 1)[1] if "__VS_PS__" in ps else ""
@@ -177,7 +205,7 @@ def verify_cmdargs(v, subs, desired):
     problems = []
     for sub in subs:
         want = desired.get(sub, "")
-        if odm.get(sub, "") != want:
+        if S.cmdargs_norm(odm.get(sub, "")) != S.cmdargs_norm(want):
             problems.append("%s ODM cmdargs %r, wanted %r" % (sub, odm.get(sub, ""), want))
     for sub in subs:
         want = desired.get(sub, "")
@@ -188,7 +216,7 @@ def verify_cmdargs(v, subs, desired):
             problems.append("%s runs without %r: %s" % (sub, want, proc[0].strip()))
     return {
         "check": "cmdargs",
-        "command": "lssrc -Ss <sub>; ps -ef | grep mibd",
+        "command": "odmget -q subsysname=<sub> SRCsubsys; ps -ef | grep mibd",
         "ok": not problems,
         "rc": 0 if not problems else 1,
         "output": ("; ".join(problems) or
@@ -352,8 +380,8 @@ def install_files(v, conf_new, rc_new):
 def chssys_set(v, values):
     """chssys each subsystem to the given cmdargs, then read the ODM back.
 
-    chssys exiting 0 is not proof: `lssrc -Ss` reads the stored value, and that
-    is what the next start of the daemon will use.
+    chssys exiting 0 is not proof: the ODM read-back is, and that is what the next
+    start of the daemon will use.
     """
     if not values:
         return
@@ -362,7 +390,8 @@ def chssys_set(v, values):
     if rc != 0:
         raise V.Abort("chssys failed: %s" % out.strip()[-400:])
     now = read_cmdargs(v, sorted(values))
-    wrong = [(s, now.get(s, ""), a) for s, a in sorted(values.items()) if now.get(s, "") != a]
+    wrong = [(s, now.get(s, ""), a) for s, a in sorted(values.items())
+             if S.cmdargs_norm(now.get(s, "")) != S.cmdargs_norm(a)]
     if wrong:
         raise V.Abort("the ODM cmdargs do not hold what chssys wrote: %s"
                       % ", ".join("%s %r (wanted %r)" % w for w in wrong))

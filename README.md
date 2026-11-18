@@ -57,7 +57,7 @@ With no `--community` it tests the community the host is configured for — the 
 
 | check | command | proves |
 |---|---|---|
-| `cmdargs` | `lssrc -Ss <sub>`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
+| `cmdargs` | `odmget -q subsysname=<sub> SRCsubsys`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
 | `system` | `snmpinfo -md -v -c <c> system` | the master answers on 161 (`sysDescr`) |
 | `aixmibd` | `snmpinfo -md -c <c> aixpagingspace` | the aixMIB subtree is registered |
 | `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1.1.0` | host resources are registered |
@@ -120,8 +120,10 @@ from `snmpdv3.conf` and is never `chssys`'d.
 2. Upload both files to padmin's home, `cp` them into `/etc` as root (overwriting the inode
    keeps `root:system` and `644`), remove the staged copies.
 3. Read both files back and compare — `cp` exiting 0 is not proof the bytes landed.
-4. `chssys` each subagent whose stored cmdargs differ, then read them back with
-   `lssrc -Ss` — `chssys` exiting 0 is not proof the ODM holds the value either.
+4. `chssys` each subagent whose stored cmdargs differ, then read the value back with
+   `odmget -q subsysname=<sub> SRCsubsys` — `chssys` exiting 0 is not proof the ODM holds
+   the value either. `odmget` names the attribute, so the read cannot be shifted by the
+   value itself the way a colon-separated `lssrc -Ss` row can.
 5. Stop the subagents, then `snmpd`; start `snmpd`, then the subagents with a plain
    `startsrc -s <sub>`, which picks up the cmdargs just written.
 6. Checks: the ODM cmdargs, `ps -ef | grep mibd` showing `-c <community>` on each running

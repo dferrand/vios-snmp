@@ -197,12 +197,43 @@ class CmdargsTest(unittest.TestCase):
     def test_parse_reads_the_third_field_of_lssrc_Ss(self):
         row = ("#subsysname:synonym:cmdargs:path:uid:auditid:standin:standout:standerr\n"
                "aixmibd::-c foo1234:/usr/sbin/aixmibd:0:0:/dev/console:/dev/console:/dev/console:\n")
-        self.assertEqual(S.cmdargs_parse(row), "-c foo1234")
+        self.assertEqual(S.cmdargs_from_lssrc(row), "-c foo1234")
 
     def test_parse_of_a_blank_cmdargs_is_empty(self):
         row = "aixmibd:::/usr/sbin/aixmibd:0:0:/dev/console:/dev/console:/dev/console:\n"
-        self.assertEqual(S.cmdargs_parse(row), "")
-        self.assertEqual(S.cmdargs_parse("# only a header\n"), "")
+        self.assertEqual(S.cmdargs_from_lssrc(row), "")
+        self.assertEqual(S.cmdargs_from_lssrc("# only a header\n"), "")
+
+    def test_odmget_reads_the_quoted_cmdargs(self):
+        # The technote's own output, attributes and all.
+        stanza = ('SRCsubsys:\n'
+                  '\tsubsysname = "aixmibd"\n'
+                  '\tsynonym = ""\n'
+                  '\tcmdargs = "-c foo1234"\n'
+                  '\tpath = "/usr/sbin/aixmibd"\n'
+                  '\tgrpname = "tcpip"\n')
+        self.assertEqual(S.cmdargs_from_odm(stanza), "-c foo1234")
+
+    def test_odmget_without_a_cmdargs_attribute_is_none(self):
+        # None, not "": the caller falls back to lssrc only when the read failed.
+        self.assertIsNone(S.cmdargs_from_odm(""))
+        self.assertIsNone(S.cmdargs_from_odm('SRCsubsys:\n\tsubsysname = "aixmibd"\n'))
+
+    def test_odmget_blank_cmdargs_is_empty(self):
+        self.assertEqual(S.cmdargs_from_odm('SRCsubsys:\n\tsubsysname = "x"\n\tcmdargs = ""\n'), "")
+
+    def test_a_colon_in_the_value_survives_odmget(self):
+        # lssrc -Ss renders a colon-separated row, so a colon in the value shifts
+        # every field after it; odmget quotes the value and cannot be shifted.
+        stanza = 'SRCsubsys:\n\tsubsysname = "aixmibd"\n\tcmdargs = "-c a:b"\n'
+        self.assertEqual(S.cmdargs_from_odm(stanza), "-c a:b")
+
+    def test_spacing_and_quotes_are_not_drift(self):
+        self.assertEqual(S.cmdargs_norm("-c   CHANGEME "), S.cmdargs_norm("-c CHANGEME"))
+        self.assertEqual(S.cmdargs_norm("'-c CHANGEME'"), "-c CHANGEME")
+        desired = S.cmdargs_desired(COMMUNITY)
+        stored = {s: "-c  %s" % COMMUNITY for s in S.SUBAGENTS}
+        self.assertEqual(S.cmdargs_changes(stored, desired), [])
 
     def test_changes_name_only_what_differs(self):
         desired = S.cmdargs_desired(COMMUNITY)

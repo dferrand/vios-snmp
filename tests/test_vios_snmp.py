@@ -1,8 +1,8 @@
 """vios_snmp.py end to end against a fake VIOS: plan, apply, restart, verify, roll back.
 
-The fake also models the SRC subsystem object: `lssrc -Ss` returns the cmdargs
-that chssys stored, and `ps -ef` shows what the running subagents were started
-with, so the two halves of the cmdargs check are both exercised.
+The fake also models the SRC subsystem object: `odmget` returns the stanza and
+`lssrc -Ss` the colon-separated row, and `ps -ef` shows what the running
+subagents were started with, so every half of the cmdargs check is exercised.
 """
 import contextlib
 import io
@@ -50,7 +50,8 @@ def configured():
 def healthy(**kw):
     """A VIOS that is fully configured and answering: the baseline for the --test mode."""
     conf, rc_text = configured()
-    fake = FakeVios(conf=conf, rc=rc_text, cmdargs={s: SUBCMD for s in S.SUBAGENTS}, **kw)
+    kw.setdefault("cmdargs", {s: SUBCMD for s in S.SUBAGENTS})
+    fake = FakeVios(conf=conf, rc=rc_text, **kw)
     fake.services = {s: "active" for s in S.SUBSYSTEMS}
     return fake
 
@@ -59,7 +60,8 @@ class FakeVios(object):
     """Answers the scripts vios_snmp.py sends, and keeps the files and the ODM in memory."""
 
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
-                 chssys_sticks=True, ps_hides=False, bodies=None):
+                 chssys_sticks=True, ps_hides=False, bodies=None,
+                 odm_absent=False, lssrc_cmdargs=None):
         self.host = "vios1"
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
@@ -69,6 +71,8 @@ class FakeVios(object):
         self.chssys_sticks = chssys_sticks     # False: chssys exits 0 but nothing is stored
         self.ps_hides = ps_hides               # True: processes run without their -c
         self.bodies = dict(bodies or {})       # {check: (snmpinfo output, rc)} overrides
+        self.odm_absent = odm_absent           # True: odmget returns nothing (lssrc fallback)
+        self.lssrc_cmdargs = lssrc_cmdargs     # what lssrc -Ss claims, when it disagrees
         self.puts = {}
         self.calls = []
 
@@ -114,8 +118,36 @@ class FakeVios(object):
 
     # -- far-side behaviour ----------------------------------------------
     def _src_row(self, sub):
-        return "%s::%s:/usr/sbin/%s:0:0:/dev/console:/dev/console:/dev/console:" % (
-            sub, self.cmdargs.get(sub, ""), sub)
+        args = self.cmdargs.get(sub, "")
+        if self.lssrc_cmdargs is not None:
+            args = self.lssrc_cmdargs.get(sub, "")
+        return "%s::%s:/usr/sbin/%s:0:0:/dev/console:/dev/console:/dev/console:" % (sub, args, sub)
+
+    def _odm(self, sub):
+        """The SRCsubsys stanza exactly as odmget prints it."""
+        if self.odm_absent:
+            return ""
+        return ("SRCsubsys:\n"
+                '\tsubsysname = "%s"\n'
+                '\tsynonym = ""\n'
+                '\tcmdargs = "%s"\n'
+                '\tpath = "/usr/sbin/%s"\n'
+                '\tuid = "0"\n'
+                '\tauditid = "0"\n'
+                '\tstandin = "/dev/console"\n'
+                '\tstandout = "/dev/console"\n'
+                '\tstanderr = "/dev/console"\n'
+                '\taction = "-O"\n'
+                '\tmulti = "-Q"\n'
+                '\tcontact = "-K"\n'
+                '\tsvrkey = "0"\n'
+                '\tsvrmtype = "0"\n'
+                '\tpriority = "20"\n'
+                '\tsignorm = "0"\n'
+                '\tsigforce = "0"\n'
+                '\tdisplay = "-d"\n'
+                '\twaittime = "20"\n'
+                '\tgrpname = "tcpip"\n') % (sub, self.cmdargs.get(sub, ""), sub)
 
     def _probe(self):
         out = ["__VS_AGENT__", "lrwxrwxrwx 1 root system 9 Nov  9 2015 /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne",
@@ -123,7 +155,7 @@ class FakeVios(object):
         for s in S.SUBSYSTEMS:
             out += ["__VS_SVC__" + s, " %s        tcpip      %-8s %s" % (s, 1234, self.services[s])]
         for s in S.SUBAGENTS:
-            out += ["__VS_CMD__" + s, self._src_row(s)]
+            out += ["__VS_CMD__" + s, self._odm(s), "__VS_LSSRC__" + s, self._src_row(s)]
         return "\n".join(out + ["__VS_CONF__", self.files[S.CONF].rstrip("\n"),
                                 "__VS_RC__", self.files[S.RC_TCPIP].rstrip("\n"), "__VS_END__", ""])
 
@@ -162,7 +194,9 @@ class FakeVios(object):
                            % (s, (" " + arg) if arg else ""))
         for s in S.SUBAGENTS:
             if "__VS_CMD__" + s in cmd:
-                out += ["__VS_CMD__" + s, self._src_row(s)]
+                out += ["__VS_CMD__" + s, self._odm(s)]
+            if "__VS_LSSRC__" + s in cmd:
+                out += ["__VS_LSSRC__" + s, self._src_row(s)]
         return "\n".join(out + [""])
 
     def _verify(self, cmd):
@@ -436,6 +470,48 @@ class TestModeTest(unittest.TestCase):
     def test_test_and_apply_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
             run(["--test", "--apply", "--community", COMMUNITY], healthy())
+
+
+class CmdargsReadTest(unittest.TestCase):
+    """Reading the ODM: an already-correct value must not look like drift."""
+
+    def test_an_odm_that_is_already_right_is_not_drift(self):
+        fake = healthy()
+        rc, out, _ = run(["--community", COMMUNITY, "--json"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["cmdargs_changes"], [])
+        self.assertIn("configuration already matches the plan", run(["--community", COMMUNITY], healthy())[1])
+
+    def test_extra_spacing_in_the_odm_is_not_drift(self):
+        fake = healthy(cmdargs={s: "-c   %s" % COMMUNITY for s in S.SUBAGENTS})
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("configuration already matches the plan", out)
+
+    def test_odmget_wins_over_a_stale_lssrc_row(self):
+        fake = healthy(lssrc_cmdargs={s: "-c STALE" for s in S.SUBAGENTS})
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("configuration already matches the plan", out)
+
+    def test_lssrc_is_the_fallback_when_odmget_returns_nothing(self):
+        fake = healthy(odm_absent=True)
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("configuration already matches the plan", out)
+
+    def test_a_different_community_is_still_drift(self):
+        fake = healthy(cmdargs={s: "-c oldcomm" for s in S.SUBAGENTS})
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 10)
+        self.assertIn("chssys -s aixmibd -a '-c %s'" % COMMUNITY, out)
+
+    def test_the_probe_queries_odmget_for_each_subagent(self):
+        fake = healthy()
+        run(["--community", COMMUNITY], fake)
+        probe = [c for c in fake.calls if "__VS_AGENT__" in c][0]
+        for sub in S.SUBAGENTS:
+            self.assertIn("odmget -q subsysname=%s SRCsubsys" % sub, probe)
 
 
 if __name__ == "__main__":
