@@ -309,9 +309,6 @@ def run_services(v, enabled, stop=False):
     ]
     # The children's first connect attempt happens the moment they start, so let
     # snmpd finish listening first: 1473-665 in a child's log is that race.
-    # dpid2 is the proxy the children connect to; without it they never register.
-    lines += ['lssrc -s dpid2 >/dev/null 2>&1 && (lssrc -s dpid2 2>/dev/null | grep -q active '
-              '|| startsrc -s dpid2)', "sleep 2"]
     lines.append("sleep 5")
     for sub in subs:
         lines.append("lssrc -s %s 2>/dev/null | grep -q active || startsrc -s %s" % (sub, sub))
@@ -497,12 +494,8 @@ def verify_settled(v, p, community, enabled, cmdargs):
     return results
 
 
-def subagent_hint(body, sub, siblings_ok=False, dpid2=""):
+def subagent_hint(body, sub, siblings_ok=False):
     """Why a subagent can run with the right community and still serve nothing."""
-    if dpid2 and dpid2 != "active":
-        return ("dpid2 is %s: the DPI2 children connect to that proxy, not to snmpd "
-                "directly, so none of them can register. startsrc -s dpid2, and start it "
-                "at boot too (its rc.tcpip line ships commented out)" % dpid2)
     if "No response" in body or "Timeout" in body or "0821-103" in body:
         return ("nothing answered for that community: check that snmpd is running and that "
                 "the COMMUNITY line accepts it (the system check says whether the master "
@@ -599,8 +592,7 @@ def verify(v, p, community, enabled, cmdargs):
         if not ok and key in S.SUBAGENTS and cmd_check is not None and cmd_check["ok"]:
             # The subagent demonstrably runs with the community, so the failure is
             # about the answer, not the credential.
-            r["hint"] = subagent_hint(body, key, siblings_ok and key != "snmpmibd",
-                                      p.get("dpid2", ""))
+            r["hint"] = subagent_hint(body, key, siblings_ok and key != "snmpmibd")
         results.append(r)
     return results
 
@@ -612,9 +604,7 @@ def show_probe(p, host, args):
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
     if p.get("dpid2") and p["dpid2"] != "unknown":
-        print("  %-10s %s%s" % ("dpid2", p["dpid2"],
-                                "" if p["dpid2"] == "active" else
-                                "  (the DPI2 children connect to it, not to snmpd)"))
+        print("  %-10s %s" % ("dpid2", p["dpid2"]))
     if p.get("agent_ip"):
         print("  %-10s %s" % ("agent ip", p["agent_ip"]))
     if p.get("local_ips"):

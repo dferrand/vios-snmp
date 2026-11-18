@@ -660,25 +660,15 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertIn("FAIL aixmibd", out)
         self.assertIn("bounce the four daemons in order", out)
 
-    def test_all_children_missing_points_at_dpid2(self):
-        # What 10.17.10.21 shows: every subtree absent, because the proxy is down.
-        fake = healthy(dpid2="inoperative", bodies={k: ("noSuchName at position 1", 0)
-                                                    for k in ("system", "snmpmibd",
-                                                              "aixmibd", "hostmibd")})
-        fake.bodies.pop("system")
+    def test_dpid2_is_reported_but_not_blamed(self):
+        # dpid2 is inoperative on VIOSes where the child subtrees answer fine, so it
+        # is a fact to show, not a diagnosis to draw.
+        fake = healthy(dpid2="inoperative", bodies={"aixmibd": ("noSuchName at position 1", 0)})
         rc, out, _ = run(["--test"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("dpid2      inoperative", out)
-        self.assertIn("dpid2 is inoperative", out)
-        self.assertIn("startsrc -s dpid2", out)
-
-    def test_restart_starts_dpid2_when_it_is_down(self):
-        fake = healthy(dpid2="inoperative")
-        with unittest.mock.patch.object(T, "SETTLE_PAUSE", 0):
-            rc, out, _ = run(["--restart"], fake)
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(fake.dpid2, "active")
-        self.assertIn("startsrc -s dpid2", " ".join(fake.calls))
+        self.assertNotIn("dpid2 is", out)
+        self.assertNotIn("startsrc -s dpid2", out)
 
     def test_a_nosuchname_subtree_gets_the_registration_hint(self):
         # What 10.17.10.21 said: the master answers, the subtree is not in its tree.
