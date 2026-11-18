@@ -62,11 +62,15 @@ class FakeVios(object):
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
-                 agent_link="snmpdv3ne"):
+                 agent_link="snmpdv3ne", ssw_text="SNMP V3 encryption is disabled.",
+                 ssw_sticks=True):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
+        self.agent_link = agent_link
         self.agent_line = ("lrwxrwxrwx    1 root     system            9 Oct 06 12:59 "
                            "/usr/sbin/snmpd -> %s" % agent_link)
+        self.ssw_text = ssw_text
+        self.ssw_sticks = ssw_sticks           # False: snmpv3_ssw -n exits 0 and changes nothing
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -101,6 +105,16 @@ class FakeVios(object):
             return 0, self._probe()
         if "__VS_T_" in cmd:
             return 0, self._verify(cmd)
+        if "snmpv3_ssw -n" in cmd:
+            if self.ssw_sticks:
+                self.agent_link = "snmpdv3ne"
+                self.agent_line = ("lrwxrwxrwx    1 root     system            9 Oct 06 12:59 "
+                                   "/usr/sbin/snmpd -> snmpdv3ne")
+            return 0, ""
+        if "snmpv3_ssw -l" in cmd:
+            return 0, self.ssw_text
+        if "ls -l /usr/sbin/snmpd" in cmd:
+            return 0, self.agent_line
         if "chssys" in cmd:
             return 0, self._chssys(cmd)
         if "__VS_CMD__" in cmd:
@@ -157,6 +171,7 @@ class FakeVios(object):
 
     def _probe(self):
         out = ["__VS_AGENT__", self.agent_line,
+               "__VS_SSW__", self.ssw_text,
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -595,13 +610,39 @@ class AgentLinkTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL agent", out)
 
-    def test_apply_refuses_on_the_wrong_agent(self):
+    def test_plan_offers_the_snmpv3_ssw_fix(self):
         fake = healthy(agent_link="/usr/sbin/snmpdv1")
+        rc, out, _ = run(["--community", COMMUNITY, "--json"], fake)
+        report = json.loads(out)
+        self.assertEqual(rc, 10)
+        self.assertEqual(report["agent_change"]["command"], "snmpv3_ssw -n")
+        self.assertEqual(report["agent_change"]["before"], "/usr/sbin/snmpdv1")
+        self.assertIn("agent link  (1 change)", run(["--community", COMMUNITY], healthy(agent_link="/usr/sbin/snmpdv1"))[1])
+
+    def test_apply_switches_the_link_with_snmpv3_ssw(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1")
+        rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.agent_link, "snmpdv3ne")
+        self.assertIn("snmpv3_ssw -n: /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne", out)
+        ssw = [i for i, c in enumerate(fake.calls) if "snmpv3_ssw -n" in c]
+        stop = [i for i, c in enumerate(fake.calls) if "stopsrc" in c]
+        self.assertTrue(ssw)
+        self.assertLess(ssw[0], stop[0])          # the link before the daemons come back
+        self.assertIn("ok   agent", out)
+
+    def test_apply_aborts_when_the_switch_does_not_take(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1", ssw_sticks=False)
         rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("not snmpdv3ne", err)
         self.assertFalse([c for c in fake.calls if "chssys" in c or c.startswith("cp ")])
-        self.assertEqual(fake.puts, {})
+
+    def test_test_mode_never_switches_the_link(self):
+        fake = healthy(agent_link="/usr/sbin/snmpdv1")
+        rc, _, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertFalse([c for c in fake.calls if "snmpv3_ssw -n" in c])
 
     def test_the_encrypted_agent_is_reported_but_not_blocked(self):
         fake = healthy(agent_link="snmpdv3e")

@@ -78,6 +78,9 @@ def _first_row(text, minfields=3):
 # The two agents that read /etc/snmpdv3.conf. Anything else linked at
 # /usr/sbin/snmpd means a different configuration file, i.e. a different tool.
 AGENTS_OK = ("snmpdv3ne", "snmpdv3e")
+# snmpv3_ssw is the AIX switch for the agent itself: -n selects the non-crypto
+# snmpdv3ne, -e the encrypted snmpdv3e (needs snmp.crypto), -l reports the mode.
+SWITCH_CMD = "snmpv3_ssw -n"
 
 
 def agent_target(ls_line):
@@ -94,19 +97,19 @@ def agent_target(ls_line):
     return target
 
 
-def agent_state(agent):
+def agent_state(agent, ssw=""):
     """(ok, message) for the agent behind /usr/sbin/snmpd; a message is always worth printing."""
     if not agent:
-        return False, ("/usr/sbin/snmpd is not a symlink: cannot tell which agent is installed, "
-                       "and /etc/snmpdv3.conf is only read by snmpdv3ne/snmpdv3e")
+        return False, ("/usr/sbin/snmpd is not a symlink: %s points it at snmpdv3ne, the agent "
+                       "that reads /etc/snmpdv3.conf" % SWITCH_CMD)
     name = agent.rsplit("/", 1)[-1]
     if name == "snmpdv3ne":
         return True, ""
     if name == "snmpdv3e":
         return True, ("/usr/sbin/snmpd -> %s: the encrypted agent, which needs the snmp.crypto "
-                      "fileset (snmpv3_ssw -l shows the mode)" % agent)
-    return False, ("/usr/sbin/snmpd -> %s, not snmpdv3ne: that agent does not read "
-                   "/etc/snmpdv3.conf, so configuring it is not what this tool does" % agent)
+                      "fileset (%s reports the mode)" % (agent, ssw or "snmpv3_ssw -l"))
+    return False, ("/usr/sbin/snmpd -> %s, not snmpdv3ne: %s switches the link to snmpdv3ne, the "
+                   "agent that reads /etc/snmpdv3.conf" % (agent, SWITCH_CMD))
 
 
 def cmdargs_script(subs):
@@ -150,6 +153,8 @@ def probe(v):
     script = "\n".join([
         "echo __VS_AGENT__",
         "ls -l /usr/sbin/snmpd 2>&1",
+        "echo __VS_SSW__",
+        "snmpv3_ssw -l 2>&1",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
         "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
@@ -171,7 +176,9 @@ def probe(v):
         b = out.find(end, a + 1) if a >= 0 else -1
         return out[a + len(start):b].strip("\n") if a >= 0 and b > a else ""
 
-    agent_line = block("__VS_AGENT__", "__VS_BOOTUP__").strip().split("\n")[0]
+    agent_line = block("__VS_AGENT__", "__VS_SSW__").strip().split("\n")[0]
+    # snmpv3_ssw -l: which agent mode is switched on, and whether crypto is there.
+    ssw = " ".join(block("__VS_SSW__", "__VS_BOOTUP__").split())
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -191,6 +198,7 @@ def probe(v):
         # read the same; the raw line is kept for the report.
         "agent": agent_target(agent_line),
         "agent_raw": agent_line,
+        "ssw": ssw,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -284,14 +292,30 @@ def snmp_failure(body):
     return any(m in body for m in SNMP_FAILURES)
 
 
-def verify_agent(agent):
+def fix_agent_link(v):
+    """Point /usr/sbin/snmpd at snmpdv3ne with snmpv3_ssw, then prove it landed."""
+    rc, out = v.root(SWITCH_CMD, timeout=120)
+    if rc != 0:
+        raise V.Abort("%s failed: %s" % (SWITCH_CMD, out.strip()[-400:]))
+    rc, out = v.root("ls -l /usr/sbin/snmpd 2>&1", timeout=60)
+    if rc != 0:
+        raise V.Abort("cannot read /usr/sbin/snmpd after %s: %s" % (SWITCH_CMD, out.strip()[-400:]))
+    lines = [l for l in out.splitlines() if "snmpd" in l and "->" in l]
+    now = agent_target(lines[-1]) if lines else ""
+    if now.rsplit("/", 1)[-1] != "snmpdv3ne":
+        raise V.Abort("after %s /usr/sbin/snmpd points at %s, not snmpdv3ne"
+                      % (SWITCH_CMD, now or "nothing"))
+    return now
+
+
+def verify_agent(agent, ssw=""):
     """The link itself: /etc/snmpdv3.conf is only read by snmpdv3ne/snmpdv3e."""
-    ok, msg = agent_state(agent)
+    ok, msg = agent_state(agent, ssw)
     return {"check": "agent", "command": "ls -l /usr/sbin/snmpd", "ok": ok,
             "rc": 0 if ok else 1, "output": msg or agent}
 
 
-def verify(v, community, enabled, cmdargs, agent=""):
+def verify(v, community, enabled, cmdargs, agent="", ssw=""):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
     Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
@@ -330,7 +354,7 @@ def verify(v, community, enabled, cmdargs, agent=""):
                      "output": body.strip()[:400]})
     # The link comes first: if it is not a v3 agent, every other check is
     # measuring the wrong daemon, or a file nothing reads.
-    results = [verify_agent(agent)]
+    results = [verify_agent(agent, ssw)]
     if subs:
         # A wrong community on the subagents is named as the cause rather than
         # showing up as an empty aixMIB subtree.
@@ -343,6 +367,8 @@ def verify(v, community, enabled, cmdargs, agent=""):
 def show_probe(p, host, args):
     print("%s  (VIOS %s)" % (host, p["level"]))
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
+    if p.get("ssw"):
+        print("  %-10s %s" % ("ssw", p["ssw"]))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
     auto = S.rc_autostart(p["rc_tcpip"])
     print("  %-10s %s" % ("at boot", ", ".join("%s %s" % (s, "yes" if auto[s] else "no") for s in S.SUBSYSTEMS)))
@@ -373,6 +399,13 @@ def show_results(results, only_failures=False):
         else:
             print("  FAIL %s: %s\n       %s"
                   % (r["check"], r["command"], r["output"] or "(no output: nothing came back)"))
+
+
+def show_agent_link(agent):
+    """The link repair: snmpv3_ssw, not a hand-made symlink."""
+    print("\nagent link  (1 change)")
+    print("  /usr/sbin/snmpd -> %s" % (agent or "(not a symlink)"))
+    print("    %s   (switches it to /usr/sbin/snmpdv3ne)" % SWITCH_CMD)
 
 
 def show_cmdargs(changes):
@@ -470,8 +503,13 @@ def apply_cmdargs(v, cmd_changes):
     return [(sub, before) for sub, before, after in cmd_changes]
 
 
-def rollback(v, keep, enabled, restore_files, cmd_restore, restart=True):
+def rollback(v, keep, enabled, restore_files, cmd_restore, restart=True, link_switched=False):
     ok = True
+    if link_switched:
+        # snmpv3_ssw only knows the two v3 agents, so an arbitrary previous target
+        # cannot be put back; say so instead of pretending the host is untouched.
+        log("the agent link was switched to snmpdv3ne and is left there: snmpv3_ssw cannot "
+            "restore another target")
     if restore_files:
         log("rolling back to the backups in %s" % keep)
         rc, out = v.root("cp -p %s/snmpdv3.conf.bak %s && cp -p %s/rc.tcpip.bak %s"
@@ -552,19 +590,21 @@ def main(argv=None):
                                       for s, b, a in cmd_changes],
                   "verify": [], "ok": True}
         drift = bool(conf_changes or rc_changes or cmd_changes)
-        # The link decides which file this tool may edit at all, so it is a
-        # finding on every run and a hard stop for --apply.
-        agent_ok, agent_msg = agent_state(p["agent"])
+        # The link decides which file this tool may edit at all: a wrong one is a
+        # plan item repaired with snmpv3_ssw, not a hand-made symlink.
+        agent_ok, agent_msg = agent_state(p["agent"], p.get("ssw", ""))
+        link_fix = not agent_ok
         if agent_msg:
             report["findings"].insert(0, agent_msg)
+        if link_fix:
+            report["agent_change"] = {"file": "/usr/sbin/snmpd", "before": p["agent"],
+                                      "after": "/usr/sbin/snmpdv3ne", "command": SWITCH_CMD}
+            drift = True
 
         if not args.json:
             show_probe(p, args.host, args)
             for f in report["findings"]:
                 print("  %-10s %s" % ("finding", f))
-
-        if args.apply and not agent_ok:
-            raise V.Abort("%s: %s" % (args.host, agent_msg))
 
         if args.test:                                # read-only: prove what it answers now
             # Test with the community the host is configured for unless one is
@@ -573,7 +613,8 @@ def main(argv=None):
             report["community"] = comm
             if not args.json:
                 print("\ntesting with community '%s' (no writes)" % comm)
-            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
+            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled),
+                             p["agent"], p.get("ssw", ""))
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             report["ok"] = not failed
@@ -593,6 +634,8 @@ def main(argv=None):
             return 0
 
         if not args.json:
+            if link_fix:
+                show_agent_link(p["agent"])
             if conf_changes:
                 show_changes(CONF, conf_changes)
             if rc_changes:
@@ -604,8 +647,9 @@ def main(argv=None):
             if not drift:
                 print("\nconfiguration already matches the plan")
             else:
-                print("\nplan: %d change(s) in %s, %d in %s, %d SRC cmdargs; daemons would be %s"
+                print("\nplan: %d change(s) in %s, %d in %s, %d SRC cmdargs%s; daemons would be %s"
                       % (len(conf_changes), CONF, len(rc_changes), RC_TCPIP, len(cmd_changes),
+                         ", the agent link" if link_fix else "",
                          "restarted" if drift else "left running"))
             if not args.manager:
                 print("note: no --manager given, so any source address may poll (0.0.0.0 0.0.0.0)")
@@ -624,6 +668,12 @@ def main(argv=None):
             if not args.json:
                 print("\napplying to %s ..." % args.host)
             try:
+                # The link first: the daemons that come back must be the right agent.
+                if link_fix:
+                    p["agent"] = fix_agent_link(v)
+                    report["agent"] = p["agent"]
+                    if not args.json:
+                        print("  %s: /usr/sbin/snmpd -> %s" % (SWITCH_CMD, p["agent"]))
                 if restore_files:
                     keep = backup(v)
                     install_files(v, conf_new, rc_new)
@@ -633,7 +683,8 @@ def main(argv=None):
                     print("  SRC cmdargs set with chssys: %s"
                           % ", ".join("%s '%s'" % (s, a) for s, b, a in cmd_changes))
             except Exception:
-                rollback(v, keep, enabled, restore_files, cmd_restore, restart=False)
+                rollback(v, keep, enabled, restore_files, cmd_restore, restart=False,
+                         link_switched=link_fix)
                 raise
             if not args.no_restart:
                 run_services(v, enabled, stop=True)
@@ -644,7 +695,7 @@ def main(argv=None):
             if not args.json:
                 print("\napplied to %s; daemons left alone (--no-restart)" % args.host)
         else:
-            results = verify(v, args.community, enabled, cmdargs, p["agent"])
+            results = verify(v, args.community, enabled, cmdargs, p["agent"], p.get("ssw", ""))
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             if failed:
@@ -652,7 +703,7 @@ def main(argv=None):
                 if not args.json:
                     show_results(results, only_failures=True)
                 if drift:
-                    rollback(v, keep, enabled, restore_files, cmd_restore)
+                    rollback(v, keep, enabled, restore_files, cmd_restore, link_switched=link_fix)
                     log("verification failed: configuration rolled back")
                 else:
                     log("verification failed: the configuration was already in sync, nothing to roll back")

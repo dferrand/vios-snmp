@@ -65,8 +65,21 @@ With no `--community` it tests the community the host is configured for — the 
 
 AIX links it relatively (`snmpd -> snmpdv3ne`), so the target is resolved against
 `/usr/sbin` and compared as a path, not as text. `snmpdv3e` — the encrypted agent — passes
-with a note about the `snmp.crypto` fileset; anything else fails the test, and `--apply`
-refuses to write a file that agent would never read.
+with a note about the `snmp.crypto` fileset (`snmpv3_ssw -l` is printed as `ssw`).
+
+Any other target is a plan item, repaired the supported way rather than by hand:
+
+```
+agent link  (1 change)
+  /usr/sbin/snmpd -> /usr/sbin/snmpdv1
+    snmpv3_ssw -n   (switches it to /usr/sbin/snmpdv3ne)
+```
+
+`--apply` runs `snmpv3_ssw -n` first — before the files and before the daemons come back —
+then re-reads the link and aborts if it still points elsewhere. `--test` never switches it;
+it just fails the `agent` check. A switch is not undone by a rollback: `snmpv3_ssw` only
+knows the two v3 agents, so an arbitrary previous target cannot be restored, and the
+rollback says so.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).
