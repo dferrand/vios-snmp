@@ -201,6 +201,7 @@ a host whose files are already right and whose ODM is not.
   services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
   agent ip   172.16.7.154
   local ips  10.17.10.21, 172.16.7.154
+  host       vios21 -> 172.16.7.154 (from /etc/hosts)
   listen     tcp4 0 0 *.161 *.* LISTEN udp4 0 0 *.161 *.*
   running    20316534 /usr/sbin/snmpdv3ne since 13:44:26
 ```
@@ -210,6 +211,11 @@ a host whose files are already right and whose ODM is not.
 reports. They are printed side by side and never compared: on a VIOS the address clients poll is
 often **NAT'd** while the agent's own is the real interface address, so a difference means
 nothing.
+
+`host` is the local hostname and what `/etc/hosts` says it is. A DPI2 child reaches the master
+**by name**, so a name that resolves to an address this host does not have (`local ips`) is the
+classic reason a child logs `1473-665 Connect to SNMP agent failed` while outside clients poll
+the box happily.
 
 `--reset-boots` is for a genuinely stale `/etc/snmpd.boots` (the log says `Using existing file
 /etc/snmpd.boots`, and the address in it is gone after a network change): it moves the file to

@@ -128,6 +128,19 @@ def local_addresses(raw):
     return sorted(set(re.findall(r"inet\s+(\d+\.\d+\.\d+\.\d+)", raw)))
 
 
+def parse_host(raw):
+    """{name, ips} for the local hostname and what /etc/hosts says it is."""
+    name = ""
+    ips = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("hostname="):
+            name = s.split("=", 1)[1].strip()
+        elif s and not s.startswith("#") and len(s.split()) >= 2:
+            ips.append(s.split()[0])
+    return {"name": name, "ips": ips}
+
+
 def parse_running(raw):
     """{pid, exe, since} for the running snmpd: ps gives argv[0], /proc the real file."""
     out = {"pid": "", "exe": "", "since": "", "raw": " ".join(raw.split())}
@@ -199,6 +212,9 @@ def probe(v):
         "grep 'Agent using IP address' /var/tmp/snmpdv3.log 2>/dev/null | tail -1",
         "echo __VS_LOCALIP__",
         "ifconfig -a 2>/dev/null | grep 'inet ' | head -8",
+        "echo __VS_HOSTS__",
+        # A DPI2 child reaches the master by name, so what the name resolves to matters.
+        "h=`hostname`; echo \"hostname=$h\"; grep -w \"$h\" /etc/hosts 2>/dev/null | head -3",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
         "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
@@ -226,7 +242,8 @@ def probe(v):
     listen = " ".join(block("__VS_LISTEN__", "__VS_RUNNING__").split())
     running = parse_running(block("__VS_RUNNING__", "__VS_BOOTUP__"))
     agent_ip = logged_agent_ip(block("__VS_AGENTIP__", "__VS_LOCALIP__"))
-    local_ips = local_addresses(block("__VS_LOCALIP__", "__VS_BOOTUP__"))
+    local_ips = local_addresses(block("__VS_LOCALIP__", "__VS_HOSTS__"))
+    host = parse_host(block("__VS_HOSTS__", "__VS_BOOTUP__"))
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -250,6 +267,7 @@ def probe(v):
         "running": running,
         "agent_ip": agent_ip,
         "local_ips": local_ips,
+        "host": host,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -587,6 +605,11 @@ def show_probe(p, host, args):
         print("  %-10s %s" % ("agent ip", p["agent_ip"]))
     if p.get("local_ips"):
         print("  %-10s %s" % ("local ips", ", ".join(p["local_ips"])))
+    host = p.get("host") or {}
+    if host.get("name"):
+        print("  %-10s %s%s" % ("host", host["name"],
+                                " -> %s (from /etc/hosts)" % ", ".join(host["ips"])
+                                if host.get("ips") else " (not in /etc/hosts)"))
     if p.get("listen"):
         print("  %-10s %s" % ("listen", p["listen"]))
     run = p.get("running") or {}

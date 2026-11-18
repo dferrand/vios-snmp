@@ -71,6 +71,7 @@ class FakeVios(object):
                  agent_link="snmpdv3ne", ssw_sticks=True,
                  get_empty=False, dump_empty=False, register_after=0,
                  agent_ip="10.17.10.21", local_ips=("10.17.10.21",), boots_present=True,
+                 hostname="vios21", hosts_ips=("172.16.7.154",),
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
                  running_text=("pid=4122\n"
@@ -90,6 +91,8 @@ class FakeVios(object):
         self.agent_ip = agent_ip               # what /var/tmp/snmpdv3.log says it initialised from
         self.local_ips = list(local_ips)
         self.boots_present = boots_present     # /etc/snmpd.boots exists
+        self.hostname = hostname
+        self.hosts_ips = list(hosts_ips)       # what /etc/hosts says the hostname is
         self.register_after = register_after   # verify rounds in which children are absent
         self.verify_rounds = 0
         self.listen_text = listen_text         # netstat, for the DPI2 connect question
@@ -204,6 +207,9 @@ class FakeVios(object):
                "__VS_LOCALIP__",
                "\n".join("        inet %s netmask 0xffffff00 broadcast 10.0.0.255" % ip
                          for ip in self.local_ips),
+               "__VS_HOSTS__",
+               "\n".join(["hostname=%s" % self.hostname]
+                         + ["%s       %s" % (ip, self.hostname) for ip in self.hosts_ips]),
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -776,6 +782,7 @@ class AgentLinkTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("agent ip   172.16.7.154", out)
         self.assertIn("local ips  10.17.10.21, 172.16.7.154", out)
+        self.assertIn("host       vios21 -> 172.16.7.154 (from /etc/hosts)", out)
         self.assertNotIn("stale", out)
         self.assertNotIn("--reset-boots", out)
 
