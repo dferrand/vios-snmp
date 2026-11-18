@@ -64,6 +64,7 @@ With no `--community` it tests the community the host is configured for — the 
 | `agent` | `ls -l /usr/sbin/snmpd` | the link resolves to `snmpdv3ne` (or `snmpdv3e`), the only agents that read `/etc/snmpdv3.conf` |
 | `cmdargs` | `odmget -q subsysname=<sub> SRCsubsys`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
 | `system` | `snmpinfo -m get -c <c> 1.3.6.1.2.1.1.1.0` | the master answers on 161 (`sysDescr`) |
+| `snmpmibd` | `snmpinfo -m get -c <c> 1.3.6.1.2.1.2.1.0` | the MIB-II child answers (`ifNumber`), i.e. DPI2 registration works at all |
 | `aixmibd` | `snmpinfo -m get -c <c> 1.3.6.1.4.1.2.6.191.2.4.1.0` | aixmibd serves `aixPageThreshold` |
 | `hostmibd` | `snmpinfo -m get -c <c> 1.3.6.1.2.1.25.1.1.0` | hostmibd serves `hrSystemUptime` |
 
@@ -101,6 +102,12 @@ numeric instance needs no MIB file and cannot be misread, so it goes first; `-m 
 form, `-md`) prints the readable subtree but resolves the name through the client's MIB files,
 so on a VIOS without them it answers nothing at all rather than failing. `--json` shows which
 form answered — a host that only dumps is visible instead of silently passing.
+
+A subagent that fails while its `cmdargs` check passed carries a `hint:` line, because the
+credential is not the problem. Which hint depends on what answered: `noSuchName` from the
+master with another child answering means *this* child is not registered (bounce just it and
+look at `/var/tmp/snmpd.log`); no child answering at all points at the master, so bounce the
+four daemons in order.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).

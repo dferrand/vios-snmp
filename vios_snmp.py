@@ -363,6 +363,24 @@ def answered(pair):
     return code == 0 and bool(body) and not snmp_failure(body)
 
 
+def subagent_hint(body, sub, siblings_ok=False):
+    """Why a subagent can run with the right community and still serve nothing."""
+    if "No response" in body or "Timeout" in body or "0821-103" in body:
+        return ("nothing answered for that community: check that snmpd is running and that "
+                "the COMMUNITY line accepts it (the system check says whether the master "
+                "answers at all)")
+    if siblings_ok:
+        return ("the master answered but that subtree is not in its tree, and the other DPI2 "
+                "child does answer, so the master is registering children: this one is not "
+                "registered. "
+                "Bounce just it (stopsrc -s %s; startsrc -s %s) and check /var/tmp/snmpd.log"
+                % (sub, sub))
+    return ("the master answered but that subtree is not in its tree, so the subagent that "
+            "serves it is not registered with it. DPI2 children bind to the master that was "
+            "running when they started, so bounce the four daemons in order (--restart, or "
+            "--apply when it has changes to make)")
+
+
 def verify(v, community, enabled, cmdargs, agent=""):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
@@ -386,6 +404,13 @@ def verify(v, community, enabled, cmdargs, agent=""):
                   ['snmpinfo -m get -c "%s" 1.3.6.1.2.1.1.1.0' % q,
                    'snmpinfo -md -v -c "%s" system' % q],
                   ("sysDescr", "1.3.6.1.2.1.1.1.0")))
+    if "snmpmibd" in subs:
+        # ifNumber: the master serves the system group itself, so this is what
+        # proves the DPI2 children are working at all.
+        tests.append(("snmpmibd",
+                      ['snmpinfo -m get -c "%s" 1.3.6.1.2.1.2.1.0' % q,
+                       'snmpinfo -md -c "%s" interfaces' % q],
+                      ("ifNumber", "1.3.6.1.2.1.2.1")))
     if "aixmibd" in subs:
         tests.append(("aixmibd",
                       ['snmpinfo -m get -c "%s" %s.2.4.1.0' % (q, S.AIX_SUBTREE),
@@ -423,6 +448,8 @@ def verify(v, community, enabled, cmdargs, agent=""):
         cmd_check = verify_cmdargs(v, subs, cmdargs)
         results.append(cmd_check)
 
+    # Whether another DPI2 child answers decides what "not registered" means.
+    siblings_ok = answered(got.get("snmpmibd"))
     for key, cmds, needles in tests:
         code, body = got.get(key, (1, ""))
         ok = answered((code, body))
@@ -430,15 +457,10 @@ def verify(v, community, enabled, cmdargs, agent=""):
             ok = any(n in body for n in needles)
         r = {"check": key, "command": used.get(key, cmds[0]), "ok": ok, "rc": code,
              "output": body[:400]}
-        if not ok and key in S.SUBAGENTS and not body \
-                and cmd_check is not None and cmd_check["ok"]:
-            # No form answered while the subagent demonstrably runs with the
-            # community: the usual cause is a DPI2 child that registered with a
-            # master that has since been replaced.
-            r["hint"] = ("the subagent runs with the community but answers nothing to any "
-                         "form: DPI2 children register with the master that was running "
-                         "when they started, so bounce the four daemons in order (--restart, "
-                         "or --apply when it has changes to make)")
+        if not ok and key in S.SUBAGENTS and cmd_check is not None and cmd_check["ok"]:
+            # The subagent demonstrably runs with the community, so the failure is
+            # about the answer, not the credential.
+            r["hint"] = subagent_hint(body, key, siblings_ok and key != "snmpmibd")
         results.append(r)
     return results
 

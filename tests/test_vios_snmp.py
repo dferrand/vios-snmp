@@ -227,7 +227,7 @@ class FakeVios(object):
     def _verify(self, cmd):
         """snmpinfo answers with text shaped like the real thing: fixtures, not inline strings."""
         out = []
-        for key in ("system", "aixmibd", "hostmibd"):
+        for key in ("system", "snmpmibd", "aixmibd", "hostmibd"):
             head = "__VS_T_%s__" % key
             if head not in cmd:
                 continue
@@ -487,14 +487,14 @@ class TestModeTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL system", out)
         self.assertIn("0821-103", out)
-        self.assertIn("3 of 5 checks failed", out)
+        self.assertIn("4 of 6 checks failed", out)
 
     def test_nosuchname_fails_even_when_snmpinfo_exits_zero(self):
         fake = healthy(bodies={"hostmibd": (fixture("snmpinfo.nosuchname.txt"), 0)})
         rc, out, _ = run(["--test"], fake)
         self.assertEqual(rc, 1)
         self.assertIn("FAIL hostmibd", out)
-        self.assertIn("1 of 5 checks failed", out)
+        self.assertIn("1 of 6 checks failed", out)
 
     def test_json_test_report(self):
         rc, out, _ = run(["--test", "--json"], healthy())
@@ -502,7 +502,7 @@ class TestModeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(report["ok"])
         self.assertEqual(report["community"], COMMUNITY)
-        self.assertEqual(len(report["verify"]), 5)
+        self.assertEqual(len(report["verify"]), 6)
 
     def test_test_and_apply_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
@@ -602,6 +602,20 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL aixmibd", out)
         self.assertIn("bounce the four daemons in order", out)
+
+    def test_a_nosuchname_subtree_gets_the_registration_hint(self):
+        # What 10.17.10.21 said: the master answers, the subtree is not in its tree.
+        fake = healthy(bodies={"aixmibd": ("noSuchName at position 1", 0)})
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL aixmibd", out)
+        self.assertIn("not registered", out)
+
+    def test_the_four_daemons_all_get_a_check(self):
+        rc, out, _ = run(["--test", "--json"], healthy())
+        self.assertEqual(rc, 0)
+        names = [r["check"] for r in json.loads(out)["verify"]]
+        self.assertEqual(names, ["agent", "cmdargs", "system", "snmpmibd", "aixmibd", "hostmibd"])
 
     def test_a_usage_message_is_not_a_value(self):
         fake = healthy(bodies={"aixmibd": ("getopt: bad flag\nUsage: snmpinfo [-m mode]", 0)})
