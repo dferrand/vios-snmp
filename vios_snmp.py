@@ -584,10 +584,9 @@ def show_probe(p, host, args):
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
     if p.get("agent_ip"):
-        stale = p.get("local_ips") and p["agent_ip"] not in p["local_ips"]
-        print("  %-10s %s%s" % ("agent ip", p["agent_ip"],
-                                "  (not an address this host has: %s)"
-                                % ", ".join(p["local_ips"]) if stale else ""))
+        print("  %-10s %s" % ("agent ip", p["agent_ip"]))
+    if p.get("local_ips"):
+        print("  %-10s %s" % ("local ips", ", ".join(p["local_ips"])))
     if p.get("listen"):
         print("  %-10s %s" % ("listen", p["listen"]))
     run = p.get("running") or {}
@@ -859,12 +858,9 @@ def main(argv=None):
         link_fix = not agent_ok
         if agent_msg:
             report["findings"].insert(0, agent_msg)
-        if p.get("agent_ip") and p.get("local_ips") and p["agent_ip"] not in p["local_ips"]:
-            report["findings"].insert(0,
-                                      "the agent initialised from %s, which is not an address this "
-                                      "host has: /etc/snmpd.boots is stale, and a DPI2 child that "
-                                      "connects there cannot reach it. --reset-boots moves the file "
-                                      "aside and restarts" % p["agent_ip"])
+        # The agent's logged address is reported, not judged: on a VIOS it is often
+        # the real interface address while the address clients use is a NET
+        # (virtual) one, so a mismatch is normal and proves nothing.
         if link_fix:
             report["agent_change"] = {"file": "/usr/sbin/snmpd", "before": p["agent"],
                                       "after": "/usr/sbin/snmpdv3ne", "command": SWITCH_CMD}

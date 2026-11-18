@@ -199,21 +199,22 @@ a host whose files are already right and whose ODM is not.
 ```
   agent      /usr/sbin/snmpdv3ne
   services   snmpd active, snmpmibd active, hostmibd active, aixmibd active
-  agent ip   172.16.7.154  (not an address this host has: 10.17.10.21)
+  agent ip   172.16.7.154
+  local ips  10.17.10.21, 172.16.7.154
   listen     tcp4 0 0 *.161 *.* LISTEN udp4 0 0 *.161 *.*
   running    20316534 /usr/sbin/snmpdv3ne since 13:44:26
 ```
 
 `agent ip` is the address the agent says it initialised from, out of its own log
-(`/var/tmp/snmpdv3.log`, `Agent using IP address UDP …`). When it is not one of the host's own
-addresses, `/etc/snmpd.boots` is stale — it caches the address the agent was first set up with,
-and the log says `Using existing file /etc/snmpd.boots`. A DPI2 child connects to the agent on
-that address, so a stale one leaves the child unable to connect (`1473-665 Connect to SNMP agent
-failed`) while external clients still get answers from the real address.
+(`/var/tmp/snmpdv3.log`, `Agent using IP address UDP …`); `local ips` is what `ifconfig -a`
+reports. They are printed side by side and never compared: on a VIOS the address clients poll is
+often a **NET** (virtual) one while the agent's own is the real interface address, so a
+difference means nothing.
 
-`--reset-boots` moves the file aside to `/etc/snmpd.boots.bak.<timestamp>` — never deleted — and
-restarts the four daemons in order, so the agent rebuilds it from a current address. With v3
-users this invalidates their localized keys, which is why the old file is kept.
+`--reset-boots` is for a genuinely stale `/etc/snmpd.boots` (the log says `Using existing file
+/etc/snmpd.boots`, and the address in it is gone after a network change): it moves the file to
+`/etc/snmpd.boots.bak.<timestamp>` — never deleted, because a v3 user's localized keys would
+have to be recovered from it — and restarts the four daemons in order so the agent rebuilds it.
 
 `listen` comes from `netstat -an` (`-a` matters: without it AIX lists only connected sockets,
 never the listening one), and `running` resolves the live process through

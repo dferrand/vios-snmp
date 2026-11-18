@@ -768,19 +768,15 @@ class AgentLinkTest(unittest.TestCase):
         self.assertIn("/etc/snmpd.conf", msg)
         self.assertIn("has no effect", msg)
 
-    def test_recon_flags_an_agent_initialised_from_a_foreign_address(self):
-        # The stale-boots signature: the agent's log names an address this host
-        # does not have, so a DPI2 child connecting there cannot reach it.
-        fake = healthy(agent_ip="172.16.7.154")
+    def test_recon_reports_the_agent_address_without_judging_it(self):
+        # On a VIOS the address clients use is often a NET (virtual) one, so the
+        # agent's real-interface address differing from it means nothing.
+        fake = healthy(agent_ip="172.16.7.154", local_ips=("10.17.10.21", "172.16.7.154"))
         rc, out, _ = run([], fake)
         self.assertEqual(rc, 0)
-        self.assertIn("172.16.7.154", out)
-        self.assertIn("not an address this host has", out)
-        self.assertIn("--reset-boots", out)
-
-    def test_a_local_agent_address_raises_nothing(self):
-        rc, out, _ = run([], healthy())
-        self.assertEqual(rc, 0)
+        self.assertIn("agent ip   172.16.7.154", out)
+        self.assertIn("local ips  10.17.10.21, 172.16.7.154", out)
+        self.assertNotIn("stale", out)
         self.assertNotIn("--reset-boots", out)
 
     def test_reset_boots_moves_the_file_and_restarts(self):
