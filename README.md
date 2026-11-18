@@ -60,11 +60,14 @@ With no `--community` it tests the community the host is configured for — the 
 | `cmdargs` | `odmget -q subsysname=<sub> SRCsubsys`, `ps -ef \| grep mibd` | the ODM and the running subagents carry `-c <community>` |
 | `system` | `snmpinfo -md -v -c <c> system` | the master answers on 161 (`sysDescr`) |
 | `aixmibd` | `snmpinfo -md -c <c> aixpagingspace` | the aixMIB subtree is registered |
-| `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1.1.0` | host resources are registered |
+| `hostmibd` | `snmpinfo -md -c <c> 1.3.6.1.2.1.25.1` | the hrSystem group is registered |
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
-back printed. `snmpinfo` can exit 0 while printing an error, so the output is checked for
-`0821-103`, `No response`, `Timeout` and `noSuchName`/`noSuchObject` as well as the exit code.
+back printed (`(no output: nothing came back)` when the agent answered with nothing at all).
+`snmpinfo` can exit 0 while printing an error, so the output is checked for `0821-103`,
+`No response`, `Timeout` and `noSuchName`/`noSuchObject` as well as the exit code. The aixMIB
+check accepts the subtree OID as well as the `aixPageThreshold` symbol, because `snmpinfo`
+prints numeric OIDs when it cannot resolve the MIB name (VIOS 4.1 does).
 
 ## What it changes
 

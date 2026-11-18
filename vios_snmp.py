@@ -62,6 +62,19 @@ def _between(text, start, ends):
     return text[a:min(stops)] if stops else text[a:]
 
 
+def _first_row(text, minfields=3):
+    """The first line that looks like an lssrc row, with stray quoting removed.
+
+    `echo \"X\"` in the root shell prints the quotes, so a sentinel can arrive as
+    `"__VS_SVC__snmpd"` and leave a lone quote at the head of the value's line.
+    """
+    for line in text.splitlines():
+        line = line.strip().strip("\"'")
+        if len(line.split()) >= minfields:
+            return line
+    return ""
+
+
 def cmdargs_script(subs):
     """Far-side reads of the SRC subsystem object, one block per subagent.
 
@@ -105,7 +118,7 @@ def probe(v):
         "ls -l /usr/sbin/snmpd 2>&1",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
-        "for s in %s; do echo \\\"__VS_SVC__$s\\\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
+        "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
         "echo __VS_SVC__dpid2",
         "lssrc -s dpid2 2>&1 | tail -1",
         cmdargs_script(S.SUBAGENTS),
@@ -131,7 +144,7 @@ def probe(v):
     for sub in S.SUBSYSTEMS + ("dpid2",):
         m = raw.split("__VS_SVC__" + sub, 1)
         if len(m) == 2:
-            line = m[1].strip().split("\n")[0].strip()
+            line = _first_row(m[1])
             if "not on file" in line or not line:
                 svc[sub] = "undefined"
             else:
@@ -243,11 +256,17 @@ def verify(v, community, enabled, cmdargs):
     """
     q = community or "public"
     subs = [s for s in S.SUBAGENTS if s in enabled]
-    tests = [("system", 'snmpinfo -md -v -c "%s" system' % q, "sysDescr")]
+    tests = []
+    tests.append(("system", 'snmpinfo -md -v -c "%s" system' % q, ("sysDescr",)))
     if "aixmibd" in subs:
-        tests.append(("aixmibd", 'snmpinfo -md -c "%s" aixpagingspace' % q, "aixPageThreshold"))
+        # snmpinfo prints numeric OIDs when it cannot resolve the MIB name (VIOS
+        # 4.1 does), so the subtree OID proves the same thing as the symbol.
+        tests.append(("aixmibd", 'snmpinfo -md -c "%s" aixpagingspace' % q,
+                      ("aixPageThreshold", S.AIX_SUBTREE)))
     if "hostmibd" in subs:
-        tests.append(("hostmibd", 'snmpinfo -md -c "%s" 1.3.6.1.2.1.25.1.1.0' % q, None))
+        # The whole hrSystem group: one instance that this AIX level does not
+        # populate would otherwise fail a healthy subagent.
+        tests.append(("hostmibd", 'snmpinfo -md -c "%s" 1.3.6.1.2.1.25.1' % q, ()))
 
     script = []
     for key, cmd, _ in tests:
@@ -255,14 +274,14 @@ def verify(v, community, enabled, cmdargs):
     rc, out = v.root("\n".join(script), timeout=180)
 
     results = []
-    for key, cmd, needle in tests:
+    for key, cmd, needles in tests:
         head = "__VS_T_%s__" % key
         mrc = out.split("__VS_T_%s_rc__=" % key, 1)
         body = out.split(head, 1)[1].split("__VS_T_%s_rc__=" % key, 1)[0] if head in out else ""
         code = int(mrc[1].split()[0]) if len(mrc) == 2 and mrc[1].split() else 1
         ok = code == 0 and bool(body.strip()) and not snmp_failure(body)
-        if ok and needle:
-            ok = needle in body
+        if ok and needles:
+            ok = any(n in body for n in needles)
         results.append({"check": key, "command": cmd, "ok": ok, "rc": code,
                         "output": body.strip()[:400]})
     if subs:
@@ -305,7 +324,8 @@ def show_results(results, only_failures=False):
             if not only_failures:
                 print("  ok   %s" % r["check"])
         else:
-            print("  FAIL %s: %s\n       %s" % (r["check"], r["command"], r["output"]))
+            print("  FAIL %s: %s\n       %s"
+                  % (r["check"], r["command"], r["output"] or "(no output: nothing came back)"))
 
 
 def show_cmdargs(changes):

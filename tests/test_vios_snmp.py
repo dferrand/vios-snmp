@@ -61,7 +61,7 @@ class FakeVios(object):
 
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
                  chssys_sticks=True, ps_hides=False, bodies=None,
-                 odm_absent=False, lssrc_cmdargs=None):
+                 odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False):
         self.host = "vios1"
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
@@ -73,6 +73,8 @@ class FakeVios(object):
         self.bodies = dict(bodies or {})       # {check: (snmpinfo output, rc)} overrides
         self.odm_absent = odm_absent           # True: odmget returns nothing (lssrc fallback)
         self.lssrc_cmdargs = lssrc_cmdargs     # what lssrc -Ss claims, when it disagrees
+        # True: `echo \"X\"` in the root shell prints the quotes, as seen on VIOS 4.1
+        self.quoted_sentinels = quoted_sentinels
         self.puts = {}
         self.calls = []
 
@@ -153,7 +155,8 @@ class FakeVios(object):
         out = ["__VS_AGENT__", "lrwxrwxrwx 1 root system 9 Nov  9 2015 /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne",
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
-            out += ["__VS_SVC__" + s, " %s        tcpip      %-8s %s" % (s, 1234, self.services[s])]
+            name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
+            out += [name, " %s        tcpip      %-8s %s" % (s, 1234, self.services[s])]
         for s in S.SUBAGENTS:
             out += ["__VS_CMD__" + s, self._odm(s), "__VS_LSSRC__" + s, self._src_row(s)]
         return "\n".join(out + ["__VS_CONF__", self.files[S.CONF].rstrip("\n"),
@@ -512,6 +515,40 @@ class CmdargsReadTest(unittest.TestCase):
         probe = [c for c in fake.calls if "__VS_AGENT__" in c][0]
         for sub in S.SUBAGENTS:
             self.assertIn("odmget -q subsysname=%s SRCsubsys" % sub, probe)
+
+
+class FarSideQuirksTest(unittest.TestCase):
+    """What the root shell and this AIX level actually print, as seen on a real VIOS."""
+
+    def test_quoted_sentinels_do_not_become_the_service_status(self):
+        # `echo \"X\"` prints the quotes, so the sentinel line arrives quoted and
+        # used to leave a lone " as every subsystem's status.
+        fake = healthy(quoted_sentinels=True)
+        rc, out, _ = run([], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("snmpd active", out)
+        self.assertNotIn('"', out.split("services")[1].split("\n")[0])
+
+    def test_numeric_aixmib_output_passes(self):
+        # VIOS 4.1's snmpinfo prints numeric OIDs instead of aixPageThreshold.
+        fake = healthy(bodies={"aixmibd": (fixture("snmpinfo.aixmibd.numeric.txt"), 0)})
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   aixmibd", out)
+
+    def test_hostmibd_walks_the_hrsystem_group(self):
+        fake = healthy()
+        run(["--test"], fake)
+        cmds = [c for c in fake.calls if "__VS_T_" in c][0]
+        self.assertIn("1.3.6.1.2.1.25.1", cmds)
+        self.assertNotIn("25.1.1.0", cmds)
+
+    def test_an_empty_answer_says_so(self):
+        fake = healthy(bodies={"hostmibd": ("", 0)})
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL hostmibd", out)
+        self.assertIn("no output", out)
 
 
 if __name__ == "__main__":
