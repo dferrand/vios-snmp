@@ -245,6 +245,26 @@ def run_services(v, enabled, stop=False):
     return out
 
 
+def bounce_subsystems(v, subs):
+    """Stop and start just these subagents, leaving the master alone.
+
+    What a child that is not registered needs: it re-binds to the master that is
+    already running, without taking snmpd (and every other subtree) down.
+    """
+    if not subs:
+        return ""
+    lines = [
+        "for s in %s; do lssrc -s $s >/dev/null 2>&1 && stopsrc -s $s; done" % " ".join(subs),
+        "sleep 2",
+        "for s in %s; do startsrc -s $s; done" % " ".join(subs),
+        "sleep 3",
+    ]
+    rc, out = v.root("\n".join(lines), timeout=180)
+    if rc != 0 or "0513-" in out:
+        raise V.Abort("bouncing %s failed: %s" % (", ".join(subs), out.strip()[-600:]))
+    return out
+
+
 def verify_cmdargs(v, subs, desired):
     """One check: the ODM cmdargs match the plan and the running subagents carry them.
 
@@ -525,7 +545,10 @@ def show_cmdargs(changes):
 def build(v, args):
     """Read the VIOS and compute the desired files and SRC cmdargs. No writes."""
     p = probe(v)
-    enabled = tuple(s for s in S.SUBSYSTEMS if s in args.enable)
+    # An empty --enable means all four; appending to a non-empty default would
+    # have made `--enable aixmibd` mean "all four plus aixmibd".
+    wanted = args.enable if args.enable else list(S.SUBSYSTEMS)
+    enabled = tuple(s for s in S.SUBSYSTEMS if s in wanted)
     managers = [S.normalize_manager(m) for m in args.manager]
     conf_new, conf_changes = S.conf_desired(
         p["conf"], community=args.community, managers=managers,
@@ -659,15 +682,16 @@ def main(argv=None):
                     help="snmpModules view (default included)")
     ap.add_argument("--aix-mibs", choices=("included", "excluded"), default="included",
                     help="aixmibd subtree 1.3.6.1.4.1.2.6.191 (default included)")
-    ap.add_argument("--enable", action="append", default=list(S.SUBSYSTEMS), metavar="SUBSYS",
-                    help="subsystems to run at boot (default all four)")
+    ap.add_argument("--enable", action="append", default=None, metavar="SUBSYS",
+                    help="subsystems to configure and start (repeatable; default all four)")
     ap.add_argument("--no-traps", action="store_true", help="comment out NOTIFY/TARGET_* instead of reporting them")
     ap.add_argument("--apply", action="store_true", help="write the files and (re)start the daemons")
     ap.add_argument("--no-restart", action="store_true", help="write the files and the ODM but leave the daemons alone")
     ap.add_argument("--test", action="store_true",
                     help="run the snmpinfo checks and exit; writes nothing")
     ap.add_argument("--restart", action="store_true",
-                    help="bounce the four daemons in order and verify; writes nothing")
+                    help="bounce the four daemons in order and verify; writes nothing "
+                         "(--enable without snmpd bounces just those children)")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
     ap.add_argument("--print-config", action="store_true", help="print the files that would be written")
     args = ap.parse_args(argv)
@@ -675,7 +699,7 @@ def main(argv=None):
     if args.community is not None and not args.community.strip():
         raise SystemExit("--community must not be empty")
     for opt in ("enable",):
-        bad = [s for s in args.enable if s not in S.SUBSYSTEMS]
+        bad = [s for s in (args.enable or []) if s not in S.SUBSYSTEMS]
         if bad:
             raise SystemExit("unknown subsystem(s): %s" % ", ".join(bad))
     if args.apply and not args.community:
@@ -746,9 +770,17 @@ def main(argv=None):
             # master that was running when they started, so the order matters.
             comm = args.community or (S.active_communities(p["conf"]) or ["public"])[0]
             report["community"] = comm
-            if not args.json:
-                print("\nrestarting the four daemons in order (no writes)")
-            run_services(v, enabled, stop=True)
+            if "snmpd" in enabled:
+                if not args.json:
+                    print("\nrestarting the four daemons in order (no writes)")
+                run_services(v, enabled, stop=True)
+            else:
+                # --enable without snmpd: bounce exactly those children, master up.
+                subs = [s for s in S.SUBAGENTS if s in enabled]
+                if not args.json:
+                    print("\nbouncing %s, master left running (no writes)"
+                          % (", ".join(subs) or "nothing"))
+                bounce_subsystems(v, subs)
             results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]

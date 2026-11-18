@@ -129,15 +129,8 @@ class FakeVios(object):
             return 0, self._install(cmd)
         if cmd.startswith("cp -p") and "snmpdv3.conf.bak " in cmd:
             return 0, self._restore()
-        if "stopsrc" in cmd:
-            for s in self.services:
-                self.services[s] = "inoperative"
-            return 0, ""
-        if "startsrc" in cmd:
-            for s in S.SUBSYSTEMS:
-                if "startsrc -s %s" % s in cmd:
-                    self.services[s] = "active"
-            return 0, ""
+        if "stopsrc" in cmd or "startsrc" in cmd:
+            return 0, self._services(cmd)
         return 0, ""
 
     # -- far-side behaviour ----------------------------------------------
@@ -194,6 +187,20 @@ class FakeVios(object):
     def _restore(self):
         self.files[S.CONF] = ORIG
         self.files[S.RC_TCPIP] = RC
+        return ""
+
+    def _services(self, cmd):
+        """Model stopsrc/startsrc, including the `for s in ...` loops the tool uses."""
+        names = set(re.findall(r"(?:start|stop)src -s (\w+)", cmd))
+        for loop in re.findall(r"for s in ([\w ]+);", cmd):
+            names.update(loop.split())
+        # The tool scripts stop-then-start in one call, so apply both in order.
+        if "stopsrc" in cmd:
+            for s in names & set(self.services):
+                self.services[s] = "inoperative"
+        if "startsrc" in cmd:
+            for s in names & set(self.services):
+                self.services[s] = "active"
         return ""
 
     def _chssys(self, cmd):
@@ -654,6 +661,16 @@ class RestartTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(fake.files[S.CONF], ORIG)
         self.assertEqual(fake.puts, {})
+
+    def test_restart_can_bounce_one_child_and_leave_the_master_up(self):
+        fake = healthy()
+        rc, out, _ = run(["--restart", "--enable", "aixmibd"], fake)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("bouncing aixmibd, master left running", out)
+        bounce = [c for c in fake.calls if "stopsrc" in c][0]
+        self.assertIn("for s in aixmibd; do lssrc -s $s >/dev/null 2>&1 && stopsrc -s $s; done", bounce)
+        self.assertIn("for s in aixmibd; do startsrc -s $s; done", bounce)
+        self.assertFalse([c for c in fake.calls if "stopsrc -s snmpd" in c])
 
     def test_restart_stands_on_its_own(self):
         with self.assertRaises(SystemExit):

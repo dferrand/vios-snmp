@@ -83,7 +83,10 @@ agent link  (1 change)
     snmpv3_ssw -n   (switches it to /usr/sbin/snmpdv3ne)
 ```
 
-`--restart` is the cure for a stale registration: DPI2 children bind to the master that was
+`--restart` takes `--enable` too: with `snmpd` left out of the list it bounces exactly those
+children and leaves the master (and every other subtree) alone — the cure for one child that
+is not registered. `--restart` with no `--enable` is the cure for a wholesale stale
+registration: DPI2 children bind to the master that was
 running when they started, so a master that was replaced (by an agent switch, for instance)
 leaves them answering nothing while `lssrc` still says active. It stops the three subagents,
 then `snmpd`, and starts them back in the opposite order, then runs the same checks — and
