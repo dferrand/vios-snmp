@@ -72,6 +72,7 @@ class FakeVios(object):
                  get_empty=False, dump_empty=False, register_after=0,
                  agent_ip="10.17.10.21", local_ips=("10.17.10.21",), boots_present=True,
                  hostname="vios21", hosts_ips=("172.16.7.154",), dpid2="active",
+                 loopback_output="loopback is 127.0.0.1", loopback_rc=0,
                  v1conf="", pkg="  bos.net.tcp.client            7.2.5.0        COMMITTED  TCP",
                  listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
                               "udp4       0      0  *.161                  *.*"),
@@ -95,6 +96,7 @@ class FakeVios(object):
         self.dpid2 = dpid2                     # dpid2 subsystem status on the far side
         self.v1conf = v1conf                   # /etc/snmpd.conf: ls line + active directives
         self.pkg = pkg                         # lslpp for bos.net.tcp.client
+        self.loopback_output, self.loopback_rc = loopback_output, loopback_rc
         self.hostname = hostname
         self.hosts_ips = list(hosts_ips)       # what /etc/hosts says the hostname is
         self.register_after = register_after   # verify rounds in which children are absent
@@ -131,6 +133,8 @@ class FakeVios(object):
 
     def root(self, cmd, timeout=None):
         self.calls.append(cmd)
+        if "__VS_LOOPBACK__" in cmd:
+            return self.loopback_rc, "__VS_LOOPBACK__\n" + self.loopback_output
         if "__VS_AGENT__" in cmd:
             return 0, self._probe()
         if "__VS_T_" in cmd:
@@ -751,6 +755,45 @@ class RestartTest(unittest.TestCase):
             run(["--restart", "--apply", "--community", COMMUNITY], healthy())
         with self.assertRaises(SystemExit):
             run(["--restart", "--test"], healthy())
+
+
+class LoopbackTest(unittest.TestCase):
+    def test_lookup_timeout_does_not_abort_snmp_tests(self):
+        import subprocess
+
+        fake = healthy()
+        root = fake.root
+
+        def stalled_lookup(cmd, timeout=None):
+            if "host loopback" in cmd:
+                self.assertNotIn("__VS_AGENT__", cmd)
+                if timeout is None:
+                    self.fail("lookup requires a timeout")
+                self.assertLessEqual(timeout, 10)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return root(cmd, timeout=timeout)
+
+        fake.root = stalled_lookup
+        rc, out, err = run(["--test"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("loopback lookup timed out", out)
+        self.assertIn("all checks passed", out)
+
+    def test_unresolved_loopback_is_reported_without_editing_hosts(self):
+        fake = healthy(loopback_output="host: 0827-801 Host name loopback does not exist.",
+                       loopback_rc=1)
+        rc, out, _ = run(["--test", "--json"], fake)
+        report = json.loads(out)
+        self.assertEqual(rc, 0)  # diagnostic, not a substitute for the MIB checks
+        self.assertTrue(any("loopback" in s and "/etc/hosts" in s for s in report["findings"]))
+        self.assertTrue(any("host loopback" in cmd for cmd in fake.calls))
+        self.assertFalse(any("stopsrc" in cmd or "startsrc" in cmd for cmd in fake.calls))
+
+    def test_resolved_loopback_is_shown_without_a_warning(self):
+        rc, out, _ = run([], healthy())
+        self.assertEqual(rc, 0)
+        self.assertIn("loopback   127.0.0.1", out)
+        self.assertNotIn("check /etc/hosts", out)
 
 
 class AgentLinkTest(unittest.TestCase):

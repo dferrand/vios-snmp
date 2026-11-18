@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -212,6 +213,19 @@ def read_cmdargs(v, subs):
     return cmdargs_block(out, subs)
 
 
+def probe_loopback(v):
+    """Bound this advisory lookup independently of the SNMP probe."""
+    try:
+        rc, raw = v.root("echo __VS_LOOPBACK__\nhost loopback 2>&1", timeout=10)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "timed_out": True, "output": "loopback lookup timed out"}
+    _, marker, output = raw.partition("__VS_LOOPBACK__\n")
+    output = output if marker else "could not run host loopback"
+    return {"ok": bool(marker and rc == 0 and re.search(
+                r"(?<![\d.])127\.0\.0\.1(?![\d.])", output)),
+            "timed_out": False, "output": " ".join(output.split())[:200]}
+
+
 def probe(v):
     """One root round trip: everything the plan needs to know about this VIOS."""
     script = "\n".join([
@@ -299,6 +313,7 @@ def probe(v):
         "agent_ip": agent_ip,
         "local_ips": local_ips,
         "host": host,
+        "loopback": probe_loopback(v),
         "v1conf": v1conf,
         "pkg": pkg,
         "bootup_option": bootup,
@@ -653,6 +668,10 @@ def show_probe(p, host, args):
         print("  %-10s %s%s" % ("host", host["name"],
                                 " -> %s (from /etc/hosts)" % ", ".join(host["ips"])
                                 if host.get("ips") else " (not in /etc/hosts)"))
+    loopback = p.get("loopback")
+    if loopback is not None:
+        print("  %-10s %s" % ("loopback", "127.0.0.1" if loopback["ok"] else
+                                loopback["output"] or "lookup returned no address"))
     if p.get("listen"):
         print("  %-10s %s" % ("listen", p["listen"]))
     run = p.get("running") or {}
@@ -906,7 +925,7 @@ def main(argv=None):
          cmdargs, cmd_changes) = build(v, args)
         report = {"host": args.host, "level": p["level"], "agent": p["agent"],
                   "services": p["services"], "boot": S.rc_autostart(p["rc_tcpip"]),
-                  "cmdargs": p["cmdargs"],
+                  "cmdargs": p["cmdargs"], "loopback": p["loopback"],
                   # Findings describe the file as it will be after the plan: a
                   # TARGET_PARAMETERS naming a community that is no longer
                   # defined only matters once the new COMMUNITY lines are in.
@@ -923,6 +942,11 @@ def main(argv=None):
         # plan item repaired with snmpv3_ssw, not a hand-made symlink.
         agent_ok, agent_msg = agent_state(p["agent"])
         link_fix = not agent_ok
+        if not p["loopback"]["ok"]:
+            problem = ("loopback lookup timed out" if p["loopback"]["timed_out"] else
+                       "loopback lookup did not confirm 127.0.0.1")
+            report["findings"].insert(0, "%s: check /etc/hosts and resolver order before "
+                                      "restarting SNMP subagents" % problem)
         if agent_msg:
             report["findings"].insert(0, agent_msg)
         # The agent's logged address is reported, not judged: on a VIOS it is often

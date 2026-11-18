@@ -241,6 +241,11 @@ link points at.
 
 ## Report-only findings
 
+Recon and `--test` report whether `host loopback` on the VIOS returns `127.0.0.1`.
+If it does not, check the IPv4 loopback aliases in `/etc/hosts` and the resolver
+order before restarting SNMP subagents. The tool never changes `/etc/hosts`;
+this finding does not override the SNMP test results or change plan drift.
+
 Each run prints what it noticed but did not change: trap directives left in place, a
 `TARGET_PARAMETERS` that still names a community no `COMMUNITY` line defines (its v1 traps
 will fail silently after a community change), `DEFAULT_SECURITY`, `USM_USER` entries, and
