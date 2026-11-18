@@ -208,8 +208,8 @@ a host whose files are already right and whose ODM is not.
 `agent ip` is the address the agent says it initialised from, out of its own log
 (`/var/tmp/snmpdv3.log`, `Agent using IP address UDP …`); `local ips` is what `ifconfig -a`
 reports. They are printed side by side and never compared: on a VIOS the address clients poll is
-often a **NET** (virtual) one while the agent's own is the real interface address, so a
-difference means nothing.
+often **NAT'd** while the agent's own is the real interface address, so a difference means
+nothing.
 
 `--reset-boots` is for a genuinely stale `/etc/snmpd.boots` (the log says `Using existing file
 /etc/snmpd.boots`, and the address in it is gone after a network change): it moves the file to
