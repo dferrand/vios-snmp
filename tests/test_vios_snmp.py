@@ -63,7 +63,10 @@ class FakeVios(object):
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
                  agent_link="snmpdv3ne", ssw_sticks=True,
-                 get_empty=False, dump_empty=False):
+                 get_empty=False, dump_empty=False,
+                 listen_text=("tcp4       0      0  *.161                  *.*                    LISTEN\n"
+                              "udp4       0      0  *.161                  *.*"),
+                 running_text="    root  4122     1   0 09:00:00      -  0:07 /usr/sbin/snmpdv3ne"):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
         self.agent_link = agent_link
@@ -74,6 +77,8 @@ class FakeVios(object):
                           "[-e|-n|-1]")
         self.get_empty = get_empty             # True: `-m get` answers nothing at all
         self.dump_empty = dump_empty           # True: `-md` answers nothing either
+        self.listen_text = listen_text         # netstat, for the DPI2 connect question
+        self.running_text = running_text       # ps -ef | grep snmpd
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -168,6 +173,8 @@ class FakeVios(object):
 
     def _probe(self):
         out = ["__VS_AGENT__", self.agent_line,
+               "__VS_LISTEN__", self.listen_text,
+               "__VS_RUNNING__", self.running_text,
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             name = '"__VS_SVC__%s"' % s if self.quoted_sentinels else "__VS_SVC__" + s
@@ -718,6 +725,12 @@ class AgentLinkTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("/etc/snmpd.conf", msg)
         self.assertIn("has no effect", msg)
+
+    def test_recon_shows_the_listener_and_the_running_agent(self):
+        rc, out, _ = run([], FakeVios())
+        self.assertEqual(rc, 0)
+        self.assertIn("listen     tcp4", out)
+        self.assertIn("/usr/sbin/snmpdv3ne", out.split("running")[1].split("\n")[0])
 
     def test_the_probe_never_asks_snmpv3_ssw_for_l(self):
         # VIOS 4.1 / AIX 7 accept -e, -n and -1 only; -l prints the usage text.

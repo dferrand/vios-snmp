@@ -157,6 +157,10 @@ def probe(v):
     script = "\n".join([
         "echo __VS_AGENT__",
         "ls -l /usr/sbin/snmpd 2>&1",
+        "echo __VS_LISTEN__",
+        "netstat -An 2>/dev/null | grep '[.]161 ' | head -5",
+        "echo __VS_RUNNING__",
+        "ps -ef | grep '[s]nmpd' | head -3",
         "echo __VS_BOOTUP__",
         "lsattr -El inet0 -a bootup_option -F value 2>&1",
         "for s in %s; do echo \"__VS_SVC__$s\"; lssrc -s $s 2>&1 | tail -1; done" % " ".join(S.SUBSYSTEMS),
@@ -179,6 +183,10 @@ def probe(v):
         return out[a + len(start):b].strip("\n") if a >= 0 and b > a else ""
 
     agent_line = block("__VS_AGENT__", "__VS_BOOTUP__").strip().split("\n")[0]
+    # Where the agent listens and which binary is actually running: a DPI2 child
+    # that cannot connect (1473-665 in its log) is explained by one of these.
+    listen = " ".join(block("__VS_LISTEN__", "__VS_RUNNING__").split())
+    running = " ".join(block("__VS_RUNNING__", "__VS_BOOTUP__").split())
     bootup = block("__VS_BOOTUP__", "__VS_SVC__snmpd").strip().split("\n")[0]
     svc = {}
     raw = out[:out.find("__VS_CONF__")] if "__VS_CONF__" in out else ""
@@ -198,6 +206,8 @@ def probe(v):
         # read the same; the raw line is kept for the report.
         "agent": agent_target(agent_line),
         "agent_raw": agent_line,
+        "listen": listen,
+        "running": running,
         "bootup_option": bootup,
         "services": svc,
         # The subagents' community lives in the SRC subsystem object, so read the
@@ -236,9 +246,12 @@ def run_services(v, enabled, stop=False):
         "i=0",
         "while ! lssrc -s snmpd 2>/dev/null | grep -q active; do sleep 1; i=$((i+1)); [ $i -ge 30 ] && break; done",
     ]
+    # The children's first connect attempt happens the moment they start, so let
+    # snmpd finish listening first: 1473-665 in a child's log is that race.
+    lines.append("sleep 5")
     for sub in subs:
         lines.append("lssrc -s %s 2>/dev/null | grep -q active || startsrc -s %s" % (sub, sub))
-    lines.append("sleep 3")
+    lines.append("sleep 5")
     rc, out = v.root("\n".join(lines), timeout=240)
     if rc != 0 or "0513-" in out:
         raise V.Abort("starting the SNMP daemons failed: %s" % out.strip()[-600:])
@@ -491,6 +504,10 @@ def show_probe(p, host, args):
     print("%s  (VIOS %s)" % (host, p["level"]))
     print("  %-10s %s" % ("agent", p["agent"] or "(not a symlink)"))
     print("  %-10s %s" % ("services", ", ".join("%s %s" % (s, p["services"][s]) for s in S.SUBSYSTEMS)))
+    if p.get("listen"):
+        print("  %-10s %s" % ("listen", p["listen"]))
+    if p.get("running"):
+        print("  %-10s %s" % ("running", p["running"]))
     auto = S.rc_autostart(p["rc_tcpip"])
     print("  %-10s %s" % ("at boot", ", ".join("%s %s" % (s, "yes" if auto[s] else "no") for s in S.SUBSYSTEMS)))
     print("  %-10s %s" % ("mibd args", ", ".join("%s %s" % (s, p["cmdargs"].get(s) or "(none)")
