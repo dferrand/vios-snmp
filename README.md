@@ -32,6 +32,9 @@ tool fixes.
 ./vios_snmp.py --host vios1 --test
 ./vios_snmp.py --host vios1 --test --community 'CHANGEME'
 
+# restart: bounce the four daemons in order and check them, write nothing
+./vios_snmp.py --host vios1 --restart
+
 # apply: back up, write, restart the daemons, verify with snmpinfo, roll back on failure
 ./vios_snmp.py --host vios1 --community 'CHANGEME' --apply
 
@@ -42,7 +45,8 @@ tool fixes.
 Exit codes: `0` in sync (or applied and verified, or every check passed), `10` drift found
 in plan mode, `1` error or a failed check.
 
-Other flags: `--no-restart` (write only), `--no-traps`, `--v3-mibs excluded`,
+Other flags: `--restart` (bounce and verify), `--no-restart` (write only), `--no-traps`,
+`--v3-mibs excluded`,
 `--aix-mibs excluded`, `--enable SUBSYS` (repeatable; default all four), `--print-config`,
 `--json`, `--user`, `--ssh-opt`.
 
@@ -78,12 +82,23 @@ agent link  (1 change)
     snmpv3_ssw -n   (switches it to /usr/sbin/snmpdv3ne)
 ```
 
+`--restart` is the cure for a stale registration: DPI2 children bind to the master that was
+running when they started, so a master that was replaced (by an agent switch, for instance)
+leaves them answering nothing while `lssrc` still says active. It stops the three subagents,
+then `snmpd`, and starts them back in the opposite order, then runs the same checks — and
+writes nothing at all. The `--test` failure for that case says so in a `hint:` line.
+
 `--apply` runs `snmpv3_ssw -n` first — before the files and before the daemons come back —
 then re-reads the link and aborts if it still points elsewhere. `--test` never switches it;
 it just fails the `agent` check. If verification then fails, a rollback switches the link
 back with the matching flag (`-1` for `snmpdv1`, `-e` for `snmpdv3e`); a target `snmpv3_ssw`
 cannot select (a hand-made link to something else) is left at `snmpdv3ne`, and the rollback
 says so.
+
+A subtree that answers nothing to the `-md` form is asked again with
+`snmpinfo -m walk -c <c> <numeric subtree>`: `-md` resolves the name through the client's MIB
+files, so a missing MIB on the VIOS can make a working subagent look dead, while the numeric
+walk asks the agent directly. `--json` shows which form answered.
 
 Exit `0` when every check passes, `1` when any fails, with the failing command and what came
 back printed (`(no output: nothing came back)` when the agent answered with nothing at all).

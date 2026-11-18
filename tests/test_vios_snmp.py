@@ -62,7 +62,8 @@ class FakeVios(object):
     def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
                  chssys_sticks=True, ps_hides=False, bodies=None,
                  odm_absent=False, lssrc_cmdargs=None, quoted_sentinels=False,
-                 agent_link="snmpdv3ne", ssw_sticks=True):
+                 agent_link="snmpdv3ne", ssw_sticks=True,
+                 dump_empty=False, walk_empty=False):
         self.host = "vios1"
         # The real host prints a relative target: `snmpd -> snmpdv3ne`.
         self.agent_link = agent_link
@@ -71,6 +72,8 @@ class FakeVios(object):
         self.ssw_sticks = ssw_sticks           # False: snmpv3_ssw exits 0 and changes nothing
         self.usage_ssw = ("getopt: Not a recognized flag: l\nUsage: /usr/sbin/snmpv3_ssw "
                           "[-e|-n|-1]")
+        self.dump_empty = dump_empty           # True: `-md` answers nothing at all
+        self.walk_empty = walk_empty           # True: the `-m walk` retry answers nothing too
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
         self.cmdargs = dict(cmdargs if cmdargs is not None
@@ -225,15 +228,26 @@ class FakeVios(object):
         """snmpinfo answers with text shaped like the real thing: fixtures, not inline strings."""
         out = []
         for key in ("system", "aixmibd", "hostmibd"):
-            if "__VS_T_%s__" % key not in cmd:
+            head = "__VS_T_%s__" % key
+            if head not in cmd:
                 continue
+            # The sentinel is echoed, so the remainder starts with its closing quote:
+            # the command is the next line that mentions snmpinfo.
+            rest = cmd.split(head, 1)[1].split("\n")[1:]
+            line = next((l for l in rest if "snmpinfo" in l), "")
+            walk = "-m walk" in line
             if key in self.bodies:
                 body, rc = self.bodies[key]
+            elif walk:
+                body, rc = (("", 0) if self.walk_empty else (fixture("snmpinfo.%s.txt" % key), 0))
+            elif self.dump_empty and key != "system":
+                # What the real host did: the master answers, the subagent trees do not.
+                body, rc = "", 0
             elif self.verify_ok:
                 body, rc = fixture("snmpinfo.%s.txt" % key), 0
             else:
                 body, rc = fixture("snmpinfo.noresponse.txt"), 1
-            out += ["__VS_T_%s__" % key, body.rstrip("\n"), "__VS_T_%s_rc__=%d" % (key, rc)]
+            out += [head, body.rstrip("\n"), "__VS_T_%s_rc__=%d" % (key, rc)]
         return "\n".join(out + [""])
 
 
@@ -555,12 +569,35 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("ok   aixmibd", out)
 
-    def test_hostmibd_walks_the_hrsystem_group(self):
+    def test_hostmibd_asks_for_the_whole_host_resources_subtree(self):
         fake = healthy()
         run(["--test"], fake)
         cmds = [c for c in fake.calls if "__VS_T_" in c][0]
-        self.assertIn("1.3.6.1.2.1.25.1", cmds)
+        self.assertIn("1.3.6.1.2.1.25", cmds)
         self.assertNotIn("25.1.1.0", cmds)
+
+    def test_an_empty_dump_is_retried_with_a_walk(self):
+        fake = healthy(dump_empty=True)
+        rc, out, _ = run(["--test", "--json"], fake)
+        self.assertEqual(rc, 0, out)
+        report = json.loads(out)
+        cmds = dict((r["check"], r["command"]) for r in report["verify"])
+        self.assertIn("-m walk", cmds["aixmibd"])
+        self.assertIn("-m walk", cmds["hostmibd"])
+        self.assertIn("-md", cmds["system"])             # the one that answered first time
+
+    def test_the_hint_names_registration_when_both_forms_are_empty(self):
+        fake = healthy(dump_empty=True, walk_empty=True)
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL aixmibd", out)
+        self.assertIn("bounce the four daemons in order", out)
+
+    def test_a_usage_message_is_not_a_value(self):
+        fake = healthy(bodies={"aixmibd": ("getopt: bad flag\nUsage: snmpinfo [-m mode]", 0)})
+        rc, out, _ = run(["--test"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL aixmibd", out)
 
     def test_an_empty_answer_says_so(self):
         fake = healthy(bodies={"hostmibd": ("", 0)})
@@ -568,6 +605,37 @@ class FarSideQuirksTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL hostmibd", out)
         self.assertIn("no output", out)
+
+
+class RestartTest(unittest.TestCase):
+    """--restart: bounce the four daemons in order, write nothing, then check them."""
+
+    def test_restart_bounces_in_order_and_verifies(self):
+        fake = healthy()
+        rc, out, _ = run(["--restart"], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("restarted and verified", out)
+        stop = [c for c in fake.calls if "stopsrc" in c and "\n" in c][0]
+        self.assertLess(stop.index("for s in snmpmibd hostmibd aixmibd"),
+                        stop.index("stopsrc -s snmpd"))
+        start = [c for c in fake.calls if "startsrc" in c][-1]
+        self.assertIn("startsrc -s snmpd", start)
+        self.assertIn("startsrc -s aixmibd", start)
+        self.assertFalse([c for c in fake.calls if c.startswith("cp ") or "chssys" in c])
+
+    def test_restart_writes_nothing_even_when_the_files_drift(self):
+        fake = FakeVios()
+        fake.services = {s: "active" for s in S.SUBSYSTEMS}
+        rc, _, _ = run(["--restart"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.files[S.CONF], ORIG)
+        self.assertEqual(fake.puts, {})
+
+    def test_restart_stands_on_its_own(self):
+        with self.assertRaises(SystemExit):
+            run(["--restart", "--apply", "--community", COMMUNITY], healthy())
+        with self.assertRaises(SystemExit):
+            run(["--restart", "--test"], healthy())
 
 
 class AgentLinkTest(unittest.TestCase):

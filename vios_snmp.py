@@ -283,7 +283,9 @@ def verify_cmdargs(v, subs, desired):
 
 # snmpinfo prints these and may still exit 0, so the text is part of the verdict.
 SNMP_FAILURES = ("0821-103", "No response", "No Response", "Timeout", "timed out",
-                 "noSuchName", "noSuchObject", "is not running")
+                 "noSuchName", "noSuchObject", "is not running",
+                 # a bad flag prints the usage text and exits 2 or 0
+                 "Usage:", "Not a recognized flag")
 
 
 def snmp_failure(body):
@@ -333,51 +335,86 @@ def verify_agent(agent):
             "rc": 0 if ok else 1, "output": msg or agent}
 
 
+def run_checks(v, items):
+    """Run [(key, command)] in one root round trip -> {key: (rc, body)}."""
+    script = []
+    for key, cmd in items:
+        script += ['echo "__VS_T_%s__"' % key, "(%s) 2>&1" % cmd,
+                   'echo "__VS_T_%s_rc__=$?"' % key]
+    rc, out = v.root("\n".join(script), timeout=180)
+    got = {}
+    for key, cmd in items:
+        head = "__VS_T_%s__" % key
+        mrc = out.split("__VS_T_%s_rc__=" % key, 1)
+        body = out.split(head, 1)[1].split("__VS_T_%s_rc__=" % key, 1)[0] if head in out else ""
+        code = int(mrc[1].split()[0]) if len(mrc) == 2 and mrc[1].split() else 1
+        got[key] = (code, body.strip())
+    return got
+
+
 def verify(v, community, enabled, cmdargs, agent=""):
     """Prove the agent answers on 161, that the subagents carry the community, and that their MIBs are there.
 
     Read-only, so `--test` uses it as a smoke test on a host it is not allowed to
     change. snmpinfo can exit 0 while printing an error, so the text is checked
     for the failure strings as well as the exit code.
+
+    Each subtree gets a second, plainer question if the first comes back empty:
+    `-md` resolves a name through the client's MIB files and can answer nothing at
+    all, where `-m walk` on the numbered subtree asks the agent directly.
     """
     q = community or "public"
     subs = [s for s in S.SUBAGENTS if s in enabled]
-    tests = []
-    tests.append(("system", 'snmpinfo -md -v -c "%s" system' % q, ("sysDescr",)))
+    tests = []              # (key, command, needles, fallback command or None)
+    tests.append(("system", 'snmpinfo -md -v -c "%s" system' % q, ("sysDescr",), None))
     if "aixmibd" in subs:
         # snmpinfo prints numeric OIDs when it cannot resolve the MIB name (VIOS
         # 4.1 does), so the subtree OID proves the same thing as the symbol.
         tests.append(("aixmibd", 'snmpinfo -md -c "%s" aixpagingspace' % q,
-                      ("aixPageThreshold", S.AIX_SUBTREE)))
+                      ("aixPageThreshold", S.AIX_SUBTREE),
+                      'snmpinfo -m walk -c "%s" %s' % (q, S.AIX_SUBTREE)))
     if "hostmibd" in subs:
-        # The whole hrSystem group: one instance that this AIX level does not
-        # populate would otherwise fail a healthy subagent.
-        tests.append(("hostmibd", 'snmpinfo -md -c "%s" 1.3.6.1.2.1.25.1' % q, ()))
+        tests.append(("hostmibd", 'snmpinfo -md -c "%s" 1.3.6.1.2.1.25' % q, (),
+                      'snmpinfo -m walk -c "%s" 1.3.6.1.2.1.25' % q))
 
-    script = []
-    for key, cmd, _ in tests:
-        script += ['echo "__VS_T_%s__"' % key, "(%s) 2>&1" % cmd, 'echo "__VS_T_%s_rc__=$?"' % key]
-    rc, out = v.root("\n".join(script), timeout=180)
+    got = run_checks(v, [(key, cmd) for key, cmd, _, _ in tests])
+    retry = [(key, fb) for key, cmd, _, fb in tests if fb and not got[key][1]]
+    used = {}
+    if retry:
+        again = run_checks(v, retry)
+        for key, fb in retry:
+            if again[key][1]:
+                got[key] = again[key]
+                used[key] = fb
 
-    snmp = []
-    for key, cmd, needles in tests:
-        head = "__VS_T_%s__" % key
-        mrc = out.split("__VS_T_%s_rc__=" % key, 1)
-        body = out.split(head, 1)[1].split("__VS_T_%s_rc__=" % key, 1)[0] if head in out else ""
-        code = int(mrc[1].split()[0]) if len(mrc) == 2 and mrc[1].split() else 1
-        ok = code == 0 and bool(body.strip()) and not snmp_failure(body)
-        if ok and needles:
-            ok = any(n in body for n in needles)
-        snmp.append({"check": key, "command": cmd, "ok": ok, "rc": code,
-                     "output": body.strip()[:400]})
     # The link comes first: if it is not a v3 agent, every other check is
     # measuring the wrong daemon, or a file nothing reads.
     results = [verify_agent(agent)]
+    cmd_check = None
     if subs:
         # A wrong community on the subagents is named as the cause rather than
         # showing up as an empty aixMIB subtree.
-        results.append(verify_cmdargs(v, subs, cmdargs))
-    return results + snmp
+        cmd_check = verify_cmdargs(v, subs, cmdargs)
+        results.append(cmd_check)
+
+    for key, cmd, needles, fallback in tests:
+        code, body = got[key]
+        ok = code == 0 and bool(body) and not snmp_failure(body)
+        if ok and needles:
+            ok = any(n in body for n in needles)
+        r = {"check": key, "command": used.get(key, cmd), "ok": ok, "rc": code,
+             "output": body[:400]}
+        if not ok and key in S.SUBAGENTS and not body and not used.get(key) \
+                and cmd_check is not None and cmd_check["ok"]:
+            # Both forms are empty while the subagent demonstrably runs with the
+            # community: the usual cause is a DPI2 child that registered with a
+            # master that has since been replaced.
+            r["hint"] = ("the subagent runs with the community but answers nothing: DPI2 "
+                         "children register with the master that was running when they "
+                         "started, so bounce the four daemons in order (--restart, or "
+                         "--apply when it has changes to make)")
+        results.append(r)
+    return results
 
 
 # --------------------------------------------------------------------- report
@@ -415,6 +452,8 @@ def show_results(results, only_failures=False):
         else:
             print("  FAIL %s: %s\n       %s"
                   % (r["check"], r["command"], r["output"] or "(no output: nothing came back)"))
+            if r.get("hint"):
+                print("       hint: %s" % r["hint"])
 
 
 def show_agent_link(agent):
@@ -579,6 +618,8 @@ def main(argv=None):
     ap.add_argument("--no-restart", action="store_true", help="write the files and the ODM but leave the daemons alone")
     ap.add_argument("--test", action="store_true",
                     help="run the snmpinfo checks and exit; writes nothing")
+    ap.add_argument("--restart", action="store_true",
+                    help="bounce the four daemons in order and verify; writes nothing")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
     ap.add_argument("--print-config", action="store_true", help="print the files that would be written")
     args = ap.parse_args(argv)
@@ -593,6 +634,9 @@ def main(argv=None):
         raise SystemExit("--apply needs --community")
     if args.test and args.apply:
         raise SystemExit("--test is read-only: --apply already ends with the same checks")
+    if args.restart and (args.apply or args.test):
+        raise SystemExit("--restart stands on its own: it writes nothing, --apply and --test "
+                         "do their own restarts or none")
 
     started = time.time()
     try:
@@ -645,6 +689,26 @@ def main(argv=None):
                 show_results(results)
                 print("\n%s" % ("all checks passed" if not failed
                                 else "%d of %d checks failed" % (len(failed), len(results))))
+            if args.json:
+                print(json.dumps(report, indent=2))
+            return 0 if not failed else 1
+
+        if args.restart:                             # bounce the daemons, then check them
+            # The cure for stale DPI2 registration: the children only bind to the
+            # master that was running when they started, so the order matters.
+            comm = args.community or (S.active_communities(p["conf"]) or ["public"])[0]
+            report["community"] = comm
+            if not args.json:
+                print("\nrestarting the four daemons in order (no writes)")
+            run_services(v, enabled, stop=True)
+            results = verify(v, comm, enabled, S.cmdargs_desired(comm, enabled), p["agent"])
+            report["verify"] = results
+            failed = [r for r in results if not r["ok"]]
+            report["ok"] = not failed
+            if not args.json:
+                show_results(results)
+                print("\n%s" % ("restarted and verified" if not failed
+                                else "%d of %d checks still fail" % (len(failed), len(results))))
             if args.json:
                 print(json.dumps(report, indent=2))
             return 0 if not failed else 1
