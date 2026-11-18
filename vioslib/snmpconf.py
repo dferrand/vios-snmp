@@ -1,10 +1,13 @@
-"""Line-surgical edits to /etc/snmpdv3.conf and /etc/rc.tcpip.
+"""Line-surgical edits to /etc/snmpdv3.conf and /etc/rc.tcpip, plus the chssys plan.
 
-Both files ship with long IBM comment blocks and are also edited by hand on the
-VIO servers, so nothing here regenerates a file: each function rewrites only the
-lines it owns, keeps them where they are, and leaves every other byte alone.
+The two files ship with long IBM comment blocks and are also edited by hand on
+the VIO servers, so nothing here regenerates a file: each function rewrites only
+the lines it owns, keeps them where they are, and leaves every other byte alone.
 That is why the module is a parser plus a handful of targeted edits instead of a
 template.
+
+The subagents' community is not in either file: it is the `-c <name>` in the SRC
+subsystem object, so the last section builds the chssys plan instead of a diff.
 
 Statements in snmpdv3.conf are not order-dependent (the file says so in its own
 header), so an entry may be appended at the end when there is no existing line to
@@ -16,6 +19,7 @@ uses them to decide whether the daemons must be restarted.
 """
 
 import re
+import shlex
 
 CONF = "/etc/snmpdv3.conf"
 RC_TCPIP = "/etc/rc.tcpip"
@@ -291,20 +295,19 @@ def _find_start(lines, subs, name):
     return None
 
 
-def rc_desired(text, community=None, enabled=SUBSYSTEMS, name=RC_TCPIP):
+def rc_desired(text, enabled=SUBSYSTEMS, name=RC_TCPIP):
     """Return (new_text, changes) for /etc/rc.tcpip.
 
-    rc.tcpip starts daemons with `startsrc -s <cmd> -a "$3"`, so the subagents'
-    community has to be passed as the third argument: the ODM cmdargs are not
-    used by this script, and the subagents default to `public` otherwise.
+    Only the start lines are owned here: which daemons come up at boot. The
+    subagents' community is *not* written into this file. rc.tcpip starts them
+    with `startsrc -s <cmd> -a "$3"` and startsrc appends -a to the ODM cmdargs,
+    so an empty third argument leaves the chssys value in force. IBM technote
+    884646 puts the community in the ODM for exactly this reason.
     """
     c = Conf(text, name)
     for sub in SUBSYSTEMS:
         want = sub in enabled
-        extra = ""
-        if sub in SUBAGENTS and community and community != "public":
-            extra = ' "-c %s"' % community
-        line = 'start /usr/sbin/%s "$src_running"%s' % (sub, extra)
+        line = 'start /usr/sbin/%s "$src_running"' % sub
         i = _find_start(c.lines, SUBSYSTEMS, sub)
         if i is None:
             if want:
@@ -313,7 +316,7 @@ def rc_desired(text, community=None, enabled=SUBSYSTEMS, name=RC_TCPIP):
                 c.changes.append(Change(name, at + 1, "", line, "no start line existed: add it"))
             continue
         if want:
-            c.replace(i, line, "start at boot" + (" and hand it the subagent community" if extra else ""))
+            c.replace(i, line, "start at boot")
         else:
             # Exactly one leading #, so disabling twice is a no-op.
             c.replace(i, "#" + c.lines[i].lstrip("#").lstrip(), "not started at boot")
@@ -327,3 +330,57 @@ def rc_autostart(text):
         i = _find_start(text.splitlines(), SUBSYSTEMS, sub)
         out[sub] = bool(i is not None and not text.splitlines()[i].lstrip().startswith("#"))
     return out
+
+
+# ------------------------------------------------------------- SRC cmdargs
+#
+# The three DPI2 subagents take their community as `-c <name>` on the command
+# line. That argument belongs in the SRC subsystem object (ODM), set with
+# chssys, not in rc.tcpip: rc.tcpip starts them with `startsrc -s <cmd> -a "$3"`
+# and startsrc *appends* -a to the cmdargs from the ODM, so a plain start line
+# leaves the chssys value in force. IBM technote 884646 does it this way and
+# checks the result with `ps -ef | grep mibd` and `lssrc -Ss <sub>`.
+#
+# An empty cmdargs means "use public", which is also how the technote undoes
+# the change (`chssys -s aixmibd -a ""`).
+
+def cmdargs_desired(community, enabled=SUBSYSTEMS):
+    """{subsystem: cmdargs} for the subagents; snmpd takes its community from snmpdv3.conf."""
+    out = {}
+    for sub in SUBAGENTS:
+        if sub in enabled and community and community != "public":
+            out[sub] = "-c " + community
+        else:
+            out[sub] = ""
+    return out
+
+
+def cmdargs_parse(text):
+    """cmdargs from one `lssrc -Ss <sub>` row: the third colon-separated field.
+
+    The row is `subsysname:synonym:cmdargs:path:...`; the header line starts
+    with '#' and is skipped. Missing or blank means "no cmdargs", i.e. public.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if len(fields) >= 3:
+            return fields[2].strip()
+    return ""
+
+
+def cmdargs_changes(current, desired):
+    """[(subsystem, before, after)] for the subagents whose cmdargs differ."""
+    out = []
+    for sub in sorted(desired):
+        before = (current.get(sub) or "").strip()
+        if before != desired[sub]:
+            out.append((sub, before, desired[sub]))
+    return out
+
+
+def chssys_command(sub, cmdargs):
+    """A chssys line; empty cmdargs clears the ODM value, which means public."""
+    return "chssys -s %s -a %s" % (sub, shlex.quote(cmdargs))

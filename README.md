@@ -1,7 +1,8 @@
 # vios-snmp
 
 Configure the **SNMPv1 agent** on a PowerVM VIOS from a Linux box: `/etc/snmpdv3.conf`,
-`/etc/rc.tcpip`, the four daemons, and then prove it with `snmpinfo`.
+`/etc/rc.tcpip`, the SRC subsystem objects the subagents read their community from, the
+four daemons, and then prove it with `snmpinfo`.
 
 Traps are out of scope. `NOTIFY`, `TARGET_ADDRESS` and `TARGET_PARAMETERS` are reported
 and left alone; `--no-traps` comments them out if you really want that.
@@ -57,18 +58,35 @@ Everything else — the IBM prologue, the directive documentation, `VACM_ACCESS`
 header comment block is verified untouched by a test. Extra active `COMMUNITY` lines not in
 the plan are commented out, not deleted.
 
-**`/etc/rc.tcpip`** — the four start lines are un-commented:
+**`/etc/rc.tcpip`** — the four start lines are un-commented, and nothing else:
 
 ```
 start /usr/sbin/snmpd "$src_running"
-start /usr/sbin/snmpmibd "$src_running" "-c <community>"
-start /usr/sbin/hostmibd "$src_running" "-c <community>"
-start /usr/sbin/aixmibd "$src_running" "-c <community>"
+start /usr/sbin/snmpmibd "$src_running"
+start /usr/sbin/hostmibd "$src_running"
+start /usr/sbin/aixmibd "$src_running"
 ```
 
-The subagents take the community as a command argument because `rc.tcpip` starts them with
-`startsrc -s <cmd> -a "$3"`, so the ODM `cmdargs` do not apply and they would otherwise
-answer `public`. `dpid2` is left as the vendor shipped it.
+The community is **not** written here. `rc.tcpip` starts a daemon with
+`startsrc -s <cmd> -a "$3"`, and `startsrc` *appends* `-a` to the cmdargs stored in the
+ODM, so an empty third argument leaves the stored value in force. A start line that
+still carries `"-c <old>"` is rewritten plain, which is drift repair, not drift.
+`dpid2` is left as the vendor shipped it.
+
+**The SRC subsystem objects** — the subagents' community, set with `chssys`
+([IBM technote 884646](https://www.ibm.com/support/pages/node/884646)):
+
+```
+chssys -s snmpmibd -a "-c <community>"
+chssys -s hostmibd -a "-c <community>"
+chssys -s aixmibd  -a "-c <community>"
+```
+
+`snmpmibd`, `hostmibd` and `aixmibd` take their community as `-c <name>` on their own
+command line, and the ODM is the supported place to store it: one value then serves the
+manual `startsrc` and the reboot alike. An empty `-a` clears it, which means `public` —
+that is how `--community public` undoes a previous run. `snmpd` takes its community
+from `snmpdv3.conf` and is never `chssys`'d.
 
 ## Apply sequence
 
@@ -77,29 +95,38 @@ answer `public`. `dpid2` is left as the vendor shipped it.
 2. Upload both files to padmin's home, `cp` them into `/etc` as root (overwriting the inode
    keeps `root:system` and `644`), remove the staged copies.
 3. Read both files back and compare — `cp` exiting 0 is not proof the bytes landed.
-4. Stop the subagents, then `snmpd`; start `snmpd`, then the subagents with `-c <community>`.
-5. `snmpinfo -md -v -c <community> system`, plus `aixpagingspace` and the host-resources
+4. `chssys` each subagent whose stored cmdargs differ, then read them back with
+   `lssrc -Ss` — `chssys` exiting 0 is not proof the ODM holds the value either.
+5. Stop the subagents, then `snmpd`; start `snmpd`, then the subagents with a plain
+   `startsrc -s <sub>`, which picks up the cmdargs just written.
+6. Checks: the ODM cmdargs, `ps -ef | grep mibd` showing `-c <community>` on each running
+   subagent (the ODM alone says what the *next* start will use), then
+   `snmpinfo -md -v -c <community> system`, plus `aixpagingspace` and the host-resources
    subtree when those subagents are enabled.
-6. Any failed check → restore the backups, restart, exit 1.
+7. Any failed check → restore the backups, `chssys` the previous cmdargs back, restart,
+   exit 1.
 
-A second apply on an unchanged VIOS issues no writes and no `stopsrc`/`startsrc`: the diff
-is empty, so there is nothing to do. That is tested.
+A second apply on an unchanged VIOS issues no writes, no `chssys` and no
+`stopsrc`/`startsrc`: the diff is empty, so there is nothing to do. That is tested, as is
+a host whose files are already right and whose ODM is not.
 
 ## Report-only findings
 
 Each run prints what it noticed but did not change: trap directives left in place, a
 `TARGET_PARAMETERS` that still names a community no `COMMUNITY` line defines (its v1 traps
 will fail silently after a community change), `DEFAULT_SECURITY`, `USM_USER` entries, and
-`inet0 bootup_option` when it is not `no` (rc.tcpip then skips the SRC start path).
+`inet0 bootup_option` when it is not `no` (rc.tcpip then skips the SRC start path). Recon
+also prints `mibd args`: the community currently stored in the ODM for the three
+subagents, `(none)` meaning they answer `public`.
 
 ## Layout
 
 ```
 vios_snmp.py            CLI: probe, plan, apply, verify, rollback
-vioslib/snmpconf.py     pure functions: parse / render / diff both files
+vioslib/snmpconf.py     pure functions: parse / render / diff both files, build the chssys plan
 vioslib/vios.py         ssh/scp to the VIOS: run() as padmin, root() via oem_setup_env
-tests/test_snmpconf.py  22 tests against the real factory and hand-made files
-tests/test_vios_snmp.py CLI end to end against a fake VIOS
+tests/test_snmpconf.py  the file edits and the chssys plan, against the real factory files
+tests/test_vios_snmp.py CLI end to end against a fake VIOS (files and ODM in memory)
 ```
 
 ## Tests

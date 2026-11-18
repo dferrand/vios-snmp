@@ -4,6 +4,10 @@ The golden case is a factory VIOS file plus the hand-made configuration that run
 on the lab VIOS: the rendered result must be functionally identical to that file
 (the two files are allowed to differ in whitespace, comments and therefore line
 order, since snmpdv3.conf states that entries are not order-dependent).
+
+The subagents' community is not a file at all: it lives in the SRC subsystem
+object, set with chssys, so it is tested as the small pure functions that build
+the chssys plan (IBM technote 884646).
 """
 import os
 import sys
@@ -127,29 +131,35 @@ class EditTest(unittest.TestCase):
 
     def test_manager_normalisation(self):
         self.assertEqual(S.normalize_manager("10.20.0.10"), ("10.20.0.10", "255.255.255.255"))
-        self.assertEqual(S.normalize_manager("10.20.0.0/24"), ("10.20.0.0", "255.255.255.0"))
+        self.assertEqual(S.normalize_manager("10.30.0.0/24"), ("10.30.0.0", "255.255.255.0"))
         self.assertEqual(S.normalize_manager("0.0.0.0/0"), ("0.0.0.0", "0.0.0.0"))
         self.assertRaises(ValueError, S.normalize_manager, "10.0.0.0/33")
 
 
 class RcTcpipTest(unittest.TestCase):
+    """rc.tcpip owns one thing: which daemons start at boot. Not the community."""
+
     def setUp(self):
-        self.out, self.changes = S.rc_desired(RC, community=COMMUNITY)
+        self.out, self.changes = S.rc_desired(RC)
 
     def test_all_four_are_started_at_boot(self):
         self.assertEqual(S.rc_autostart(self.out), {s: True for s in S.SUBSYSTEMS})
         self.assertEqual(S.rc_autostart(RC), {s: False for s in S.SUBSYSTEMS})
 
-    def test_subagents_get_the_community_as_cmdargs(self):
-        # rc.tcpip starts daemons with `startsrc -s <cmd> -a "$3"`, so the ODM
-        # cmdargs do not apply and the subagents would answer `public`.
-        for sub in S.SUBAGENTS:
-            self.assertIn('start /usr/sbin/%s "$src_running" "-c %s"' % (sub, COMMUNITY), self.out)
-        self.assertIn('start /usr/sbin/snmpd "$src_running"', self.out)
+    def test_no_community_is_written_into_the_boot_script(self):
+        # The community is the ODM's business (chssys); a copy here would be a
+        # second source of truth and would override the ODM on every boot.
+        for sub in S.SUBSYSTEMS:
+            self.assertIn('start /usr/sbin/%s "$src_running"\n' % sub, self.out)
+        self.assertNotIn('"-c ', self.out)
 
-    def test_public_needs_no_argument(self):
-        out, _ = S.rc_desired(RC, community="public")
-        self.assertIn('start /usr/sbin/hostmibd "$src_running"', out)
+    def test_a_community_left_in_an_old_start_line_is_removed(self):
+        stale = RC.replace('#start /usr/sbin/aixmibd "$src_running"',
+                           'start /usr/sbin/aixmibd "$src_running" "-c oldcomm"')
+        out, changes = S.rc_desired(stale)
+        self.assertIn('start /usr/sbin/aixmibd "$src_running"\n', out)
+        self.assertNotIn("oldcomm", out)
+        self.assertEqual([c.why for c in changes], ["start at boot"] * 4)
 
     def test_dpid2_and_unrelated_daemons_untouched(self):
         self.assertIn("#start /usr/sbin/dpid2", self.out)
@@ -158,15 +168,52 @@ class RcTcpipTest(unittest.TestCase):
 
     def test_missing_start_line_is_inserted_before_the_wait(self):
         text = "\n".join(l for l in RC.splitlines() if "aixmibd" not in l) + "\n"
-        out, _ = S.rc_desired(text, community=COMMUNITY)
+        out, _ = S.rc_desired(text)
         lines = out.splitlines()
         self.assertTrue(S.rc_autostart(out)["aixmibd"])
-        self.assertLess(lines.index('start /usr/sbin/aixmibd "$src_running" "-c %s"' % COMMUNITY),
+        self.assertLess(lines.index('start /usr/sbin/aixmibd "$src_running"'),
                         [i for i, l in enumerate(lines) if "Wait for srcmstr" in l][0])
 
     def test_only_four_lines_change(self):
         self.assertEqual(len(self.changes), 4)
-        self.assertEqual(S.rc_desired(self.out, community=COMMUNITY)[1], [])
+        self.assertEqual(S.rc_desired(self.out)[1], [])
+
+
+class CmdargsTest(unittest.TestCase):
+    """The chssys plan: the subagents' community in the SRC subsystem object."""
+
+    def test_desired_covers_the_three_subagents_and_not_the_agent(self):
+        got = S.cmdargs_desired(COMMUNITY)
+        self.assertEqual(sorted(got), sorted(S.SUBAGENTS))
+        self.assertEqual(set(got.values()), {"-c " + COMMUNITY})
+
+    def test_public_needs_no_argument(self):
+        self.assertEqual(S.cmdargs_desired("public"), {s: "" for s in S.SUBAGENTS})
+
+    def test_a_disabled_subagent_gets_its_cmdargs_cleared(self):
+        got = S.cmdargs_desired(COMMUNITY, enabled=("snmpd", "aixmibd"))
+        self.assertEqual(got, {"snmpmibd": "", "hostmibd": "", "aixmibd": "-c " + COMMUNITY})
+
+    def test_parse_reads_the_third_field_of_lssrc_Ss(self):
+        row = ("#subsysname:synonym:cmdargs:path:uid:auditid:standin:standout:standerr\n"
+               "aixmibd::-c foo1234:/usr/sbin/aixmibd:0:0:/dev/console:/dev/console:/dev/console:\n")
+        self.assertEqual(S.cmdargs_parse(row), "-c foo1234")
+
+    def test_parse_of_a_blank_cmdargs_is_empty(self):
+        row = "aixmibd:::/usr/sbin/aixmibd:0:0:/dev/console:/dev/console:/dev/console:\n"
+        self.assertEqual(S.cmdargs_parse(row), "")
+        self.assertEqual(S.cmdargs_parse("# only a header\n"), "")
+
+    def test_changes_name_only_what_differs(self):
+        desired = S.cmdargs_desired(COMMUNITY)
+        self.assertEqual(S.cmdargs_changes(desired, desired), [])
+        current = dict(desired, aixmibd="")
+        self.assertEqual(S.cmdargs_changes(current, desired), [("aixmibd", "", "-c " + COMMUNITY)])
+
+    def test_chssys_command_quotes_the_argument(self):
+        self.assertEqual(S.chssys_command("aixmibd", "-c " + COMMUNITY),
+                         "chssys -s aixmibd -a '-c %s'" % COMMUNITY)
+        self.assertEqual(S.chssys_command("aixmibd", ""), "chssys -s aixmibd -a ''")
 
 
 if __name__ == "__main__":

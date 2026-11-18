@@ -1,8 +1,15 @@
-"""vios_snmp.py end to end against a fake VIOS: plan, apply, restart, verify, roll back."""
+"""vios_snmp.py end to end against a fake VIOS: plan, apply, restart, verify, roll back.
+
+The fake also models the SRC subsystem object: `lssrc -Ss` returns the cmdargs
+that chssys stored, and `ps -ef` shows what the running subagents were started
+with, so the two halves of the cmdargs check are both exercised.
+"""
 import contextlib
 import io
+import json
 import os
 import re
+import shlex
 import sys
 import unittest
 import unittest.mock
@@ -28,24 +35,35 @@ ADJUSTED = fixture("snmpdv3.conf.adjusted")
 RC = fixture("rc.tcpip.orig")
 
 COMMUNITY = "CHANGEME"
+SUBCMD = "-c " + COMMUNITY
 
 
 def without_traps(text):
     return [t for t in S.active(text) if t[0] not in S.TRAP_DIRECTIVES]
 
 
-class FakeVios(object):
-    """Answers the four scripts vios_snmp.py sends, and keeps the files in memory."""
+def configured():
+    """The two files as the tool would leave them: a host that only lacks the ODM part."""
+    return S.conf_desired(ORIG, community=COMMUNITY)[0], S.rc_desired(RC)[0]
 
-    def __init__(self, conf=ORIG, rc=RC, verify_ok=True):
+
+class FakeVios(object):
+    """Answers the scripts vios_snmp.py sends, and keeps the files and the ODM in memory."""
+
+    def __init__(self, conf=ORIG, rc=RC, verify_ok=True, cmdargs=None,
+                 chssys_sticks=True, ps_hides=False):
         self.host = "vios1"
         self.files = {S.CONF: conf, S.RC_TCPIP: rc}
         self.services = {s: "inoperative" for s in S.SUBSYSTEMS}
+        self.cmdargs = dict(cmdargs if cmdargs is not None
+                            else {s: "" for s in S.SUBAGENTS})
         self.verify_ok = verify_ok
+        self.chssys_sticks = chssys_sticks     # False: chssys exits 0 but nothing is stored
+        self.ps_hides = ps_hides               # True: processes run without their -c
         self.puts = {}
         self.calls = []
 
-    # -- the four entry points the tool uses ------------------------------
+    # -- the entry points the tool uses -----------------------------------
     def run(self, cmd, timeout=None, answer=None):
         if "ioslevel" in cmd:
             return 0, "3.1.4.20\n"
@@ -64,6 +82,10 @@ class FakeVios(object):
             return 0, self._probe()
         if "__VS_T_" in cmd:
             return 0, self._verify(cmd)
+        if "chssys" in cmd:
+            return 0, self._chssys(cmd)
+        if "__VS_CMD__" in cmd:
+            return 0, self._cmdargs(cmd)
         if cmd.startswith("mkdir -p"):
             return 0, ""
         if cmd.startswith("cp /home/padmin"):
@@ -82,11 +104,17 @@ class FakeVios(object):
         return 0, ""
 
     # -- far-side behaviour ----------------------------------------------
+    def _src_row(self, sub):
+        return "%s::%s:/usr/sbin/%s:0:0:/dev/console:/dev/console:/dev/console:" % (
+            sub, self.cmdargs.get(sub, ""), sub)
+
     def _probe(self):
         out = ["__VS_AGENT__", "lrwxrwxrwx 1 root system 9 Nov  9 2015 /usr/sbin/snmpd -> /usr/sbin/snmpdv3ne",
                "__VS_BOOTUP__", "no"]
         for s in S.SUBSYSTEMS:
             out += ["__VS_SVC__" + s, " %s        tcpip      %-8s %s" % (s, 1234, self.services[s])]
+        for s in S.SUBAGENTS:
+            out += ["__VS_CMD__" + s, self._src_row(s)]
         return "\n".join(out + ["__VS_CONF__", self.files[S.CONF].rstrip("\n"),
                                 "__VS_RC__", self.files[S.RC_TCPIP].rstrip("\n"), "__VS_END__", ""])
 
@@ -101,6 +129,32 @@ class FakeVios(object):
         self.files[S.CONF] = ORIG
         self.files[S.RC_TCPIP] = RC
         return ""
+
+    def _chssys(self, cmd):
+        for line in cmd.splitlines():
+            if not line.strip().startswith("chssys"):
+                continue
+            parts = shlex.split(line)
+            sub = parts[parts.index("-s") + 1]
+            args = parts[parts.index("-a") + 1] if "-a" in parts else ""
+            if self.chssys_sticks:
+                self.cmdargs[sub] = args
+        return ""
+
+    def _cmdargs(self, cmd):
+        out = []
+        if "__VS_PS__" in cmd:
+            out.append("__VS_PS__")
+            for s in S.SUBAGENTS:
+                if self.services.get(s) != "active":
+                    continue
+                arg = "" if self.ps_hides else self.cmdargs.get(s, "")
+                out.append("    root  1234     1   0 10:00:00      -  0:00 /usr/sbin/%s%s"
+                           % (s, (" " + arg) if arg else ""))
+        for s in S.SUBAGENTS:
+            if "__VS_CMD__" + s in cmd:
+                out += ["__VS_CMD__" + s, self._src_row(s)]
+        return "\n".join(out + [""])
 
     def _verify(self, cmd):
         body = {"system": 'sysDescr.0 = "IBM PowerPC CHRP Computer"',
@@ -135,6 +189,16 @@ class PlanTest(unittest.TestCase):
         self.assertIn("COMMUNITY %s" % COMMUNITY, out)
         self.assertIn("plan: 5 change(s)", out)
 
+    def test_plan_shows_the_chssys_commands_and_touches_no_odm(self):
+        fake = FakeVios()
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 10)
+        self.assertIn("SRC cmdargs  (3 changes)", out)
+        for sub in S.SUBAGENTS:
+            self.assertIn("chssys -s %s -a '-c %s'" % (sub, COMMUNITY), out)
+        self.assertEqual(fake.cmdargs, {s: "" for s in S.SUBAGENTS})
+        self.assertFalse([c for c in fake.calls if "chssys" in c])
+
     def test_plan_lists_the_findings(self):
         rc, out, _ = run(["--community", COMMUNITY], FakeVios())
         self.assertIn("3 trap directive(s) left untouched", out)
@@ -145,20 +209,46 @@ class PlanTest(unittest.TestCase):
         rc, out, _ = run([], fake)
         self.assertEqual(rc, 0)
         self.assertIn("snmpdv3ne", out)
+        self.assertIn("mibd args", out)
         self.assertIn("recon only", out)
         self.assertFalse([c for c in fake.calls if "cp " in c])
+
+    def test_recon_shows_the_community_already_in_the_odm(self):
+        fake = FakeVios(cmdargs={s: "-c oldcomm" for s in S.SUBAGENTS})
+        rc, out, _ = run([], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("aixmibd -c oldcomm", out)
 
     def test_manager_acl_reaches_the_file(self):
         rc, _, _ = run(["--community", "c", "--manager", "10.20.0.10", "--print-config"], FakeVios())
         self.assertEqual(rc, 10)
 
+    def test_the_boot_script_carries_no_community(self):
+        rc, out, _ = run(["--community", COMMUNITY, "--print-config"], FakeVios())
+        self.assertEqual(rc, 10)
+        rc_part = out.split("--- %s ---" % S.RC_TCPIP, 1)[1]
+        self.assertNotIn(COMMUNITY, rc_part)
+        self.assertIn('start /usr/sbin/aixmibd "$src_running"\n', rc_part)
+
     def test_json_plan_is_parseable(self):
-        import json
         rc, out, _ = run(["--community", COMMUNITY, "--json"], FakeVios())
         report = json.loads(out)
         self.assertEqual(rc, 10)
         self.assertEqual(report["host"], "vios1")
         self.assertEqual(len(report["changes"]), 9)          # 5 in snmpdv3.conf + 4 in rc.tcpip
+        self.assertEqual(len(report["cmdargs_changes"]), 3)
+        self.assertEqual(report["cmdargs_changes"][0]["command"],
+                         "chssys -s aixmibd -a '-c %s'" % COMMUNITY)
+
+    def test_a_host_that_only_lacks_the_odm_part(self):
+        conf, rc_text = configured()
+        fake = FakeVios(conf=conf, rc=rc_text)
+        rc, out, _ = run(["--community", COMMUNITY, "--json"], fake)
+        report = json.loads(out)
+        self.assertEqual(rc, 10)
+        self.assertEqual(report["changes"], [])
+        self.assertEqual([c["subsystem"] for c in report["cmdargs_changes"]],
+                         ["aixmibd", "hostmibd", "snmpmibd"])
 
 
 class ApplyTest(unittest.TestCase):
@@ -171,13 +261,32 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(S.rc_autostart(fake.files[S.RC_TCPIP]), {s: True for s in S.SUBSYSTEMS})
         self.assertEqual(fake.services, {s: "active" for s in S.SUBSYSTEMS})
         self.assertIn("ok   system", out)
+        self.assertIn("ok   cmdargs", out)
 
-    def test_subagents_are_started_with_the_community(self):
+    def test_the_community_lands_in_the_odm_not_in_rc_tcpip(self):
+        fake = FakeVios()
+        rc, _, _ = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.cmdargs, {s: SUBCMD for s in S.SUBAGENTS})
+        self.assertNotIn(COMMUNITY, fake.files[S.RC_TCPIP])
+
+    def test_chssys_runs_before_the_daemons_are_restarted(self):
+        fake = FakeVios()
+        run(["--community", COMMUNITY, "--apply"], fake)
+        chssys = [i for i, c in enumerate(fake.calls) if "chssys" in c]
+        stop = [i for i, c in enumerate(fake.calls) if "stopsrc" in c]
+        self.assertTrue(chssys)
+        self.assertLess(chssys[0], stop[0])
+
+    def test_startsrc_carries_no_argument_of_its_own(self):
+        # startsrc appends -a to the ODM cmdargs: a second copy here would win
+        # over the ODM on every boot.
         fake = FakeVios()
         run(["--community", COMMUNITY, "--apply"], fake)
         starts = [c for c in fake.calls if "startsrc" in c]
         self.assertTrue(starts)
-        self.assertIn('startsrc -s aixmibd -a "-c %s"' % COMMUNITY, starts[-1])
+        self.assertIn("startsrc -s aixmibd", starts[-1])
+        self.assertNotIn('"-c ', starts[-1])
 
     def test_subagents_stop_before_the_agent(self):
         fake = FakeVios()
@@ -194,7 +303,8 @@ class ApplyTest(unittest.TestCase):
         rc, out, _ = run(["--community", COMMUNITY, "--apply"], fake)
         self.assertEqual(rc, 0)
         self.assertIn("configuration already matches the plan", out)
-        self.assertFalse([c for c in fake.calls if "stopsrc" in c or c.startswith("cp /home/padmin")])
+        self.assertFalse([c for c in fake.calls
+                          if "stopsrc" in c or "chssys" in c or c.startswith("cp /home/padmin")])
 
     def test_apply_with_no_traps(self):
         fake = FakeVios()
@@ -202,22 +312,56 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(S.trap_entries(fake.files[S.CONF]), [])
 
-    def test_no_restart_skips_the_daemons(self):
+    def test_no_restart_skips_the_daemons_but_still_sets_the_odm(self):
         fake = FakeVios()
         rc, _, _ = run(["--community", COMMUNITY, "--apply", "--no-restart"], fake)
         self.assertEqual(rc, 0)
         self.assertEqual(fake.services, {s: "inoperative" for s in S.SUBSYSTEMS})
+        self.assertEqual(fake.cmdargs, {s: SUBCMD for s in S.SUBAGENTS})
+
+    def test_a_host_that_only_lacks_the_odm_part_rewrites_no_file(self):
+        conf, rc_text = configured()
+        fake = FakeVios(conf=conf, rc=rc_text)
+        rc, out, _ = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.cmdargs, {s: SUBCMD for s in S.SUBAGENTS})
+        self.assertFalse([c for c in fake.calls if c.startswith("cp /home/padmin")])
+        self.assertFalse(fake.puts)
+
+    def test_public_clears_the_odm_cmdargs(self):
+        fake = FakeVios(cmdargs={s: "-c oldcomm" for s in S.SUBAGENTS})
+        rc, _, _ = run(["--community", "public", "--apply"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.cmdargs, {s: "" for s in S.SUBAGENTS})
 
 
 class VerifyTest(unittest.TestCase):
-    def test_failed_check_rolls_the_files_back(self):
+    def test_failed_check_rolls_the_files_and_the_odm_back(self):
         fake = FakeVios(verify_ok=False)
         rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
         self.assertEqual(rc, 1)
         self.assertEqual(fake.files[S.CONF], ORIG)
         self.assertEqual(fake.files[S.RC_TCPIP], RC)
+        self.assertEqual(fake.cmdargs, {s: "" for s in S.SUBAGENTS})
         self.assertIn("rolling back", err)
         self.assertIn("FAIL system", out)
+
+    def test_a_chssys_that_does_not_stick_aborts_the_apply(self):
+        fake = FakeVios(chssys_sticks=False)
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("do not hold what chssys wrote", err)
+        self.assertEqual(fake.files[S.CONF], ORIG)
+        self.assertEqual(fake.files[S.RC_TCPIP], RC)
+
+    def test_a_subagent_running_without_the_community_fails_the_check(self):
+        # The ODM is right, but this boot's process was started before it changed:
+        # exactly what a stale rc.tcpip argument looks like.
+        fake = FakeVios(ps_hides=True)
+        rc, out, _ = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL cmdargs", out)
+        self.assertIn("runs without", out)
 
     def test_apply_requires_a_community(self):
         fake = FakeVios()
