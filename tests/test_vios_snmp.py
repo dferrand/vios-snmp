@@ -115,6 +115,7 @@ class FakeVios(object):
         self.lssrc_cmdargs = lssrc_cmdargs     # what lssrc -Ss claims, when it disagrees
         # True: `echo \"X\"` in the root shell prints the quotes, as seen on VIOS 4.1
         self.quoted_sentinels = quoted_sentinels
+        self.backups = {}
         self.puts = {}
         self.calls = []
 
@@ -129,7 +130,7 @@ class FakeVios(object):
             self.puts[os.path.basename(local)] = f.read()
 
     def root_read(self, path):
-        return self.files[path]
+        return (self.backups if path in self.backups else self.files)[path]
 
     def root(self, cmd, timeout=None):
         self.calls.append(cmd)
@@ -164,11 +165,15 @@ class FakeVios(object):
         if "__VS_CMD__" in cmd:
             return 0, self._cmdargs(cmd)
         if cmd.startswith("mkdir -p"):
+            for src, dest in re.findall(r"cp -p (\S+) (\S+)", cmd):
+                self.backups[dest] = self.files[src]
             return 0, ""
         if cmd.startswith("cp /home/padmin"):
             return 0, self._install(cmd)
-        if cmd.startswith("cp -p") and "snmpdv3.conf.bak " in cmd:
-            return 0, self._restore()
+        if cmd.startswith("cp -p"):
+            _, _, src, dest = cmd.split()
+            self.files[dest] = self.backups[src]
+            return 0, ""
         if "stopsrc" in cmd or "startsrc" in cmd:
             if re.search(r"startsrc -s dpid2", cmd):
                 self.dpid2 = "active"
@@ -237,11 +242,6 @@ class FakeVios(object):
             if name not in self.puts:
                 return "cp: %s: No such file" % name
             self.files[dest] = self.puts[name]
-        return ""
-
-    def _restore(self):
-        self.files[S.CONF] = ORIG
-        self.files[S.RC_TCPIP] = RC
         return ""
 
     def _services(self, cmd):
@@ -788,6 +788,72 @@ class LoopbackTest(unittest.TestCase):
         self.assertTrue(any("loopback" in s and "/etc/hosts" in s for s in report["findings"]))
         self.assertTrue(any("host loopback" in cmd for cmd in fake.calls))
         self.assertFalse(any("stopsrc" in cmd or "startsrc" in cmd for cmd in fake.calls))
+
+    def test_apply_repairs_missing_alias_preserving_existing_names(self):
+        fake = healthy(loopback_output="host: 0827-801 Host name loopback does not exist.",
+                       loopback_rc=1)
+        fake.files["/etc/hosts"] = "\n127.0.0.1\tlocalhost localname # keep\n192.0.2.5 other\n"
+        rc, out, _ = run(["--community", COMMUNITY], fake)
+        self.assertEqual(rc, 10, out)
+        self.assertIn("/etc/hosts", out)
+        self.assertFalse(fake.puts)
+        def resolve_on_write(cmd, timeout=None):
+            if "__VS_LOOPBACK__" in cmd and "localname loopback" in fake.files["/etc/hosts"]:
+                return 0, "__VS_LOOPBACK__\nloopback is 127.0.0.1"
+            return FakeVios.root(fake, cmd, timeout)
+
+        fake.root = resolve_on_write
+        rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.files["/etc/hosts"],
+                         "\n127.0.0.1\tlocalhost localname loopback # keep\n192.0.2.5 other\n")
+        self.assertEqual(set(fake.puts), {".vios_snmp.hosts"})
+        self.assertTrue(any("/etc/hosts.bak." in call for call in fake.calls))
+        fake.calls.clear()
+        fake.puts.clear()
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(fake.puts)
+        self.assertFalse(any("stopsrc" in call for call in fake.calls))
+
+    def test_apply_leaves_ambiguous_or_already_configured_hosts_alone(self):
+        for original in ("127.0.0.1 localhost loopback\n",
+                         "127.0.0.1 localhost\n192.0.2.1 loopback\n",
+                         "127.0.0.1 localhost\n127.0.0.1 other\n",
+                         "192.0.2.1 other\n"):
+            with self.subTest(original=original):
+                fake = healthy(loopback_output="not found", loopback_rc=1)
+                fake.files["/etc/hosts"] = original
+                rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("resolver order", out)
+                self.assertFalse(fake.puts)
+
+    def test_unresolved_after_edit_restores_hosts_without_restarting(self):
+        fake = healthy(loopback_output="not found", loopback_rc=1)
+        original = "127.0.0.1 localhost"
+        fake.files["/etc/hosts"] = original
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("still does not resolve", err)
+        self.assertEqual(fake.files["/etc/hosts"], original)
+        self.assertFalse(any("stopsrc" in cmd for cmd in fake.calls))
+
+    def test_snmp_verification_failure_rolls_back_loopback_repair(self):
+        fake = healthy(loopback_output="not found", loopback_rc=1, verify_ok=False)
+        original = "127.0.0.1 localhost"
+        fake.files["/etc/hosts"] = original
+
+        def resolve_on_write(cmd, timeout=None):
+            if "__VS_LOOPBACK__" in cmd and fake.files["/etc/hosts"] != original:
+                return 0, "__VS_LOOPBACK__\nloopback is 127.0.0.1"
+            return FakeVios.root(fake, cmd, timeout)
+
+        fake.root = resolve_on_write
+        rc, _, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("configuration rolled back", err)
+        self.assertEqual(fake.files["/etc/hosts"], original)
 
     def test_resolved_loopback_is_shown_without_a_warning(self):
         rc, out, _ = run([], healthy())

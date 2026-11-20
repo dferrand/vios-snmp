@@ -30,7 +30,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +43,7 @@ import vioslib.vios as V              # noqa: E402
 
 CONF = S.CONF
 RC_TCPIP = S.RC_TCPIP
+HOSTS = "/etc/hosts"
 PROBE_TIMEOUT = 120
 
 
@@ -223,7 +223,8 @@ def probe_loopback(v):
     output = output if marker else "could not run host loopback"
     return {"ok": bool(marker and rc == 0 and re.search(
                 r"(?<![\d.])127\.0\.0\.1(?![\d.])", output)),
-            "timed_out": False, "output": " ".join(output.split())[:200]}
+            "timed_out": False, "completed": bool(marker),
+            "output": " ".join(output.split())[:200]}
 
 
 def probe(v):
@@ -762,47 +763,43 @@ def build(v, args):
     return p, enabled, conf_new, conf_changes, rc_new, rc_changes, cmdargs, cmd_changes
 
 
-def backup(v):
-    """Back up both files twice: next to them for the next admin, and per run for rollback."""
+def backup(v, paths):
+    """Keep a rollback copy and a timestamped backup beside each file."""
     ts = time.strftime("%Y%m%d%H%M%S")
     keep = "/home/padmin/.vios_snmp-%s" % ts
-    rc, out = v.root("mkdir -p %s && cp -p %s %s/snmpdv3.conf.bak && cp -p %s %s/rc.tcpip.bak && "
-                     "cp -p %s %s.bak.%s && cp -p %s %s.bak.%s"
-                     % (keep, CONF, keep, RC_TCPIP, keep, CONF, CONF, ts, RC_TCPIP, RC_TCPIP, ts))
+    commands = ["mkdir -p %s" % keep]
+    for path in paths:
+        commands += ["cp -p %s %s/%s.bak" % (path, keep, os.path.basename(path)),
+                     "cp -p %s %s.bak.%s" % (path, path, ts)]
+    rc, out = v.root(" && ".join(commands))
     if rc != 0:
         raise V.Abort("cannot back up the configuration: %s" % out.strip()[-400:])
-    print("  backed up to %s (and %s.bak.%s, %s.bak.%s)" % (keep, CONF, ts, RC_TCPIP, ts))
     return keep
 
 
-def install_files(v, conf_new, rc_new):
-    """Stage, upload, cp into /etc as root, then read both files back."""
-    tmp = tempfile.mkdtemp(prefix="vios_snmp.")
-    try:
+def install_files(v, files):
+    """Stage files, copy over the existing files to retain metadata, and read back."""
+    with tempfile.TemporaryDirectory(prefix="vios_snmp.") as tmp:
         staged = {}
-        for path, text in ((CONF, conf_new), (RC_TCPIP, rc_new)):
-            name = ".vios_snmp." + os.path.basename(path)
-            local = os.path.join(tmp, name)
-            with open(local, "w") as f:
-                f.write(text)
-            staged[path] = name
-            v.put(local, "/home/padmin")
-
-        # cp over the existing inode keeps root:system and 644; /etc is root-only.
-        rc, out = v.root("cp /home/padmin/%s %s && cp /home/padmin/%s %s; r=$?; "
-                         "rm -f /home/padmin/%s /home/padmin/%s; exit $r"
-                         % (staged[CONF], CONF, staged[RC_TCPIP], RC_TCPIP, staged[CONF], staged[RC_TCPIP]))
-        if rc != 0:
-            raise V.Abort("cannot install the new configuration: %s" % out.strip()[-400:])
-
-        # Read the files back: cp reporting success is not proof the bytes landed.
-        for path, wanted in ((CONF, conf_new), (RC_TCPIP, rc_new)):
-            got = v.root_read(path)
-            if got.rstrip("\n") != wanted.rstrip("\n"):
-                raise V.Abort("%s does not hold what was written" % path)
-    finally:
-        # The staged copies carry the community; leave nothing behind in TMPDIR.
-        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            for path, text in files.items():
+                name = ".vios_snmp." + os.path.basename(path)
+                local = os.path.join(tmp, name)
+                with open(local, "w", newline="") as f:
+                    f.write(text)
+                staged[path] = "/home/padmin/" + name
+                v.put(local, "/home/padmin")
+            rc, out = v.root(" && ".join("cp %s %s" % (src, path)
+                                        for path, src in staged.items()))
+            if rc != 0:
+                raise V.Abort("cannot install the new configuration: %s" % out.strip()[-400:])
+            for path, wanted in files.items():
+                got = v.root_read(path)
+                if got != wanted:
+                    raise V.Abort("%s does not hold what was written" % path)
+        finally:
+            if staged:
+                v.root("rm -f " + " ".join(staged.values()))
 
 
 def chssys_set(v, values):
@@ -848,12 +845,15 @@ def rollback(v, keep, enabled, restore_files, cmd_restore, restart=True, link_be
                 "can select" % (link_before or "nothing"))
     if restore_files:
         log("rolling back to the backups in %s" % keep)
-        rc, out = v.root("cp -p %s/snmpdv3.conf.bak %s && cp -p %s/rc.tcpip.bak %s"
-                         % (keep, CONF, keep, RC_TCPIP))
-        if rc != 0:
-            log("ROLLBACK FAILED: %s" % out.strip()[-400:])
-            log("restore by hand: cp -p %s/snmpdv3.conf.bak %s" % (keep, CONF))
-            ok = False
+        for path in restore_files:
+            restore = "cp -p %s/%s.bak %s" % (keep, os.path.basename(path), path)
+            try:
+                rc, out = v.root(restore)
+                if rc:
+                    raise V.Abort(out.strip()[-400:])
+            except Exception as e:
+                log("ROLLBACK FAILED for %s: %s; restore by hand: %s" % (path, e, restore))
+                ok = False
     if cmd_restore:
         log("restoring the previous ODM cmdargs: %s"
             % ", ".join("%s %s" % (s, b or "(none)") for s, b in cmd_restore))
@@ -923,6 +923,17 @@ def main(argv=None):
         v = V.Vios(args.host, args.user, args.ssh_opt)
         (p, enabled, conf_new, conf_changes, rc_new, rc_changes,
          cmdargs, cmd_changes) = build(v, args)
+        hosts_before, hosts_new, hosts_changes = None, None, []
+        hosts_note = ""
+        if args.community and not (args.test or args.restart or args.reset_boots or
+                                   p["loopback"]["ok"]) and p["loopback"].get("completed"):
+            try:
+                hosts_before = v.root_read(HOSTS)
+                hosts_new, hosts_changes = S.hosts_desired(hosts_before)
+                if not hosts_changes:
+                    hosts_note = "; no safe alias edit found"
+            except (V.Abort, subprocess.TimeoutExpired):
+                hosts_note = "; could not read /etc/hosts"
         report = {"host": args.host, "level": p["level"], "agent": p["agent"],
                   "services": p["services"], "boot": S.rc_autostart(p["rc_tcpip"]),
                   "cmdargs": p["cmdargs"], "loopback": p["loopback"],
@@ -932,12 +943,12 @@ def main(argv=None):
                   "findings": S.findings(conf_new),
                   "changes": [{"file": c.path, "line": c.line, "why": c.why,
                                "before": c.before, "after": c.after}
-                              for c in conf_changes + rc_changes],
+                              for c in conf_changes + rc_changes + hosts_changes],
                   "cmdargs_changes": [{"subsystem": s, "before": b, "after": a,
                                        "command": S.chssys_command(s, a)}
                                       for s, b, a in cmd_changes],
                   "verify": [], "ok": True}
-        drift = bool(conf_changes or rc_changes or cmd_changes)
+        drift = bool(conf_changes or rc_changes or cmd_changes or hosts_changes)
         # The link decides which file this tool may edit at all: a wrong one is a
         # plan item repaired with snmpv3_ssw, not a hand-made symlink.
         agent_ok, agent_msg = agent_state(p["agent"])
@@ -945,8 +956,10 @@ def main(argv=None):
         if not p["loopback"]["ok"]:
             problem = ("loopback lookup timed out" if p["loopback"]["timed_out"] else
                        "loopback lookup did not confirm 127.0.0.1")
-            report["findings"].insert(0, "%s: check /etc/hosts and resolver order before "
-                                      "restarting SNMP subagents" % problem)
+            finding = ("%s: add the missing /etc/hosts alias" % problem if hosts_changes else
+                       "%s: check /etc/hosts and resolver order before restarting SNMP subagents%s"
+                       % (problem, hosts_note))
+            report["findings"].insert(0, finding)
         if agent_msg:
             report["findings"].insert(0, agent_msg)
         # The agent's logged address is reported, not judged: on a VIOS it is often
@@ -1027,6 +1040,8 @@ def main(argv=None):
                 show_changes(CONF, conf_changes)
             if rc_changes:
                 show_changes(RC_TCPIP, rc_changes)
+            if hosts_changes:
+                show_changes(HOSTS, hosts_changes)
             if cmd_changes:
                 show_cmdargs(cmd_changes)
             if args.print_config:
@@ -1036,7 +1051,7 @@ def main(argv=None):
             else:
                 print("\nplan: %d change(s) in %s, %d in %s, %d SRC cmdargs%s; daemons would be %s"
                       % (len(conf_changes), CONF, len(rc_changes), RC_TCPIP, len(cmd_changes),
-                         ", the agent link" if link_fix else "",
+                         (", the agent link" if link_fix else "") + (", /etc/hosts" if hosts_changes else ""),
                          "restarted" if drift else "left running"))
             if not args.manager:
                 print("note: no --manager given, so any source address may poll (0.0.0.0 0.0.0.0)")
@@ -1051,7 +1066,11 @@ def main(argv=None):
         keep = None
         cmd_restore = []
         link_before = ""
-        restore_files = bool(conf_changes or rc_changes)
+        files = {CONF: conf_new, RC_TCPIP: rc_new} if (conf_changes or rc_changes) else {}
+        if hosts_changes:
+            files[HOSTS] = hosts_new
+        restore_files = ()
+        restarting = False
         if drift:
             if not args.json:
                 print("\napplying to %s ..." % args.host)
@@ -1063,20 +1082,32 @@ def main(argv=None):
                     report["agent"] = p["agent"]
                     if not args.json:
                         print("  %s: /usr/sbin/snmpd -> %s" % (SWITCH_CMD, p["agent"]))
-                if restore_files:
-                    keep = backup(v)
-                    install_files(v, conf_new, rc_new)
+                if files:
+                    keep = backup(v, files)
+                    if hosts_changes and (v.root_read(HOSTS) != hosts_before or
+                                          v.root_read(keep + "/hosts.bak") != hosts_before):
+                        raise V.Abort("/etc/hosts changed during apply; re-run the plan")
+                    if not args.json:
+                        print("  backed up to %s (also beside the original files)" % keep)
+                    restore_files = tuple(files)
+                    install_files(v, files)
+                    if hosts_changes:
+                        report["loopback"] = probe_loopback(v)
+                        if not report["loopback"]["ok"]:
+                            raise V.Abort("loopback still does not resolve to 127.0.0.1 after editing "
+                                          "/etc/hosts; check resolver order (NSORDER and /etc/netsvc.conf)")
                 # The ODM before the restart: startsrc reads it at start time.
                 cmd_restore = apply_cmdargs(v, cmd_changes)
                 if cmd_changes and not args.json:
                     print("  SRC cmdargs set with chssys: %s"
                           % ", ".join("%s '%s'" % (s, a) for s, b, a in cmd_changes))
+                if not args.no_restart:
+                    restarting = True
+                    run_services(v, enabled, stop=True)
             except Exception:
-                rollback(v, keep, enabled, restore_files, cmd_restore, restart=False,
+                rollback(v, keep, enabled, restore_files, cmd_restore, restart=restarting,
                          link_before=link_before)
                 raise
-            if not args.no_restart:
-                run_services(v, enabled, stop=True)
         elif not args.no_restart:
             run_services(v, enabled)                  # in sync: just start what is down
 
@@ -1084,7 +1115,12 @@ def main(argv=None):
             if not args.json:
                 print("\napplied to %s; daemons left alone (--no-restart)" % args.host)
         else:
-            results = verify_settled(v, p, args.community, enabled, cmdargs)
+            try:
+                results = verify_settled(v, p, args.community, enabled, cmdargs)
+            except Exception:
+                if drift:
+                    rollback(v, keep, enabled, restore_files, cmd_restore, link_before=link_before)
+                raise
             report["verify"] = results
             failed = [r for r in results if not r["ok"]]
             if failed:
@@ -1092,8 +1128,10 @@ def main(argv=None):
                 if not args.json:
                     show_results(results, only_failures=True)
                 if drift:
-                    rollback(v, keep, enabled, restore_files, cmd_restore, link_before=link_before)
-                    log("verification failed: configuration rolled back")
+                    restored = rollback(v, keep, enabled, restore_files, cmd_restore,
+                                        link_before=link_before)
+                    log("verification failed: %s" % ("configuration rolled back" if restored else
+                                                     "rollback did not complete"))
                 else:
                     log("verification failed: the configuration was already in sync, nothing to roll back")
                 if args.json:

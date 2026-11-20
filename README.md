@@ -174,9 +174,10 @@ from `snmpdv3.conf` and is never `chssys`'d.
 
 1. `cp -p` backups next to the files (`<file>.bak.<timestamp>`) and into
    `/home/padmin/.vios_snmp-<timestamp>/`.
-2. Upload both files to padmin's home, `cp` them into `/etc` as root (overwriting the inode
-   keeps `root:system` and `644`), remove the staged copies.
-3. Read both files back and compare — `cp` exiting 0 is not proof the bytes landed.
+2. Upload the files being installed to padmin's home, `cp` them into `/etc` as root
+   (overwriting the existing inode preserves ownership and mode), and remove the staged copies.
+3. Read the installed files back and compare. If `/etc/hosts` was repaired, also verify
+   that `loopback` resolves to `127.0.0.1` before restarting services.
 4. `chssys` each subagent whose stored cmdargs differ, then read the value back with
    `odmget -q subsysname=<sub> SRCsubsys` — `chssys` exiting 0 is not proof the ODM holds
    the value either. `odmget` names the attribute, so the read cannot be shifted by the
@@ -239,12 +240,18 @@ Those two lines are what a child's `1473-665 Connect to SNMP agent failed` is ab
 has to be listening on a socket the child can reach, and the process has to be the agent the
 link points at.
 
-## Report-only findings
+## Loopback name resolution
 
 Recon and `--test` report whether `host loopback` on the VIOS returns `127.0.0.1`.
-If it does not, check the IPv4 loopback aliases in `/etc/hosts` and the resolver
-order before restarting SNMP subagents. The tool never changes `/etc/hosts`;
-this finding does not override the SNMP test results or change plan drift.
+If the lookup fails and a single existing `127.0.0.1` row is missing the
+`loopback` alias, the plan shows the edit. `--apply` backs up `/etc/hosts`, adds
+only the alias, and verifies name resolution before restarting SNMP. If the
+lookup still fails, it restores the original file. A lookup timeout, an already
+configured alias, or a missing or ambiguous row requires manual investigation;
+the tool does not add rows or change resolver order. Recon, plan, and `--test`
+never write `/etc/hosts`.
+
+## Report-only findings
 
 Each run prints what it noticed but did not change: trap directives left in place, a
 `TARGET_PARAMETERS` that still names a community no `COMMUNITY` line defines (its v1 traps

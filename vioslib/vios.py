@@ -72,11 +72,12 @@ class Vios(object):
 
     def root_read(self, path):
         """Contents of a root-only file, delimited so the root shell's banner is not mistaken for data."""
-        rc, out = self.root("echo __VS_BEGIN__\ncat %s\necho __VS_END__" % shlex.quote(path))
-        m = re.search(r"^__VS_BEGIN__\s*$(.*)^__VS_END__\s*$", out, re.S | re.M)
-        if not m:
-            raise Abort("cannot read %s on %s: %s" % (path, self.host, out.strip()[-400:]))
-        return m.group(1).lstrip("\n")
+        rc, out = self.root("echo __VS_BEGIN__\ncat %s && printf '\\n__VS_END__\\n'"
+                            % shlex.quote(path), timeout=30)
+        m = re.search(r"^__VS_BEGIN__\n(.*)\n__VS_END__$", out, re.S | re.M)
+        if rc or not m:
+            raise Abort("cannot read %s on %s" % (path, self.host))
+        return m.group(1)
 
     def put(self, local, remote_dir):
         p = _run(["scp", "-q"] + self.opts + [local, "%s:%s/" % (self.target, remote_dir)])

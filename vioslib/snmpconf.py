@@ -302,6 +302,29 @@ def _find_start(lines, subs, name):
     return None
 
 
+def hosts_desired(text):
+    """Add the alias only if there is one unambiguous IPv4 loopback row."""
+    rows = text.splitlines(keepends=True)
+    candidates = []
+    for i, row in enumerate(rows):
+        body, _, _ = row.partition("#")
+        fields = body.split()
+        if not fields:
+            continue
+        if any(name.lower().rstrip(".") == "loopback" for name in fields[1:]):
+            return text, []  # already configured or mapped elsewhere; do not guess
+        if fields[0] == "127.0.0.1":
+            candidates.append((i, len(body.rstrip())))
+    if len(candidates) != 1:
+        return text, []
+    i, end = candidates[0]
+    before = rows[i]
+    tail = before[end:]
+    rows[i] = before[:end] + " loopback" + (" " if tail.startswith("#") else "") + tail
+    return "".join(rows), [Change("/etc/hosts", i + 1, before.rstrip("\r\n"),
+                                  rows[i].rstrip("\r\n"), "add the IPv4 loopback alias")]
+
+
 def rc_desired(text, enabled=SUBSYSTEMS, name=RC_TCPIP):
     """Return (new_text, changes) for /etc/rc.tcpip.
 
