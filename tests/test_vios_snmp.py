@@ -816,9 +816,29 @@ class LoopbackTest(unittest.TestCase):
         self.assertFalse(fake.puts)
         self.assertFalse(any("stopsrc" in call for call in fake.calls))
 
+    def test_apply_adds_ipv4_alias_when_ipv6_loopback_already_has_it(self):
+        ipv6 = "::1                 loopback localhost      # IPv6 loopback (lo0) name/address\n"
+        original = "127.0.0.1   localhost\n" + ipv6
+        repaired = "127.0.0.1   localhost loopback\n" + ipv6
+        fake = healthy(loopback_output="host: 0827-801 Host name loopback does not exist.",
+                       loopback_rc=1)
+        fake.files["/etc/hosts"] = original
+
+        def resolve_on_write(cmd, timeout=None):
+            if "__VS_LOOPBACK__" in cmd and fake.files["/etc/hosts"] == repaired:
+                return 0, "__VS_LOOPBACK__\nlocalhost is 127.0.0.1, Aliases: loopback"
+            return FakeVios.root(fake, cmd, timeout)
+
+        fake.root = resolve_on_write
+        rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.files["/etc/hosts"], repaired)
+        self.assertIn("applied and verified", out)
+
     def test_apply_leaves_ambiguous_or_already_configured_hosts_alone(self):
         for original in ("127.0.0.1 localhost loopback\n",
                          "127.0.0.1 localhost\n192.0.2.1 loopback\n",
+                         "127.0.0.1 localhost\n2001:db8::1 loopback\n",
                          "127.0.0.1 localhost\n127.0.0.1 other\n",
                          "192.0.2.1 other\n"):
             with self.subTest(original=original):

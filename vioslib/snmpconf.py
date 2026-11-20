@@ -18,6 +18,7 @@ Every edit is returned as a Change record: the CLI prints them as a diff and
 uses them to decide whether the daemons must be restarted.
 """
 
+import ipaddress
 import re
 import shlex
 
@@ -312,7 +313,14 @@ def hosts_desired(text):
         if not fields:
             continue
         if any(name.lower().rstrip(".") == "loopback" for name in fields[1:]):
-            return text, []  # already configured or mapped elsewhere; do not guess
+            try:
+                ipv6_loopback = ipaddress.ip_address(fields[0]) == ipaddress.IPv6Address("::1")
+            except ValueError:
+                ipv6_loopback = False
+            # An IPv6 loopback alias can coexist with the IPv4 alias. Leave
+            # that row intact, but refuse other mappings or an existing alias.
+            if not ipv6_loopback:
+                return text, []
         if fields[0] == "127.0.0.1":
             candidates.append((i, len(body.rstrip())))
     if len(candidates) != 1:

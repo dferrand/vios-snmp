@@ -246,10 +246,11 @@ Recon and `--test` report whether `host loopback` on the VIOS returns `127.0.0.1
 If the lookup fails and a single existing `127.0.0.1` row is missing the
 `loopback` alias, the plan shows the edit. `--apply` backs up `/etc/hosts`, adds
 only the alias, and verifies name resolution before restarting SNMP. If the
-lookup still fails, it restores the original file. A lookup timeout, an already
-configured alias, or a missing or ambiguous row requires manual investigation;
-the tool does not add rows or change resolver order. Recon, plan, and `--test`
-never write `/etc/hosts`.
+lookup still fails, it restores the original file. An existing IPv6 loopback
+entry (`::1`) is left intact and does not block the IPv4 repair. A lookup timeout,
+an alias on any other address, or a missing or ambiguous IPv4 row requires
+manual investigation; the tool does not add rows or change resolver order.
+Recon, plan, and `--test` never write `/etc/hosts`.
 
 ## Report-only findings
 
