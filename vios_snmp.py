@@ -328,6 +328,16 @@ def probe(v):
     }
 
 
+# Match the status field for the named subsystem, not a substring of its row.
+SRC_ACTIVE = """src_active() {
+    lssrc -s "$1" 2>/dev/null | awk -v service="$1" '$1 == service && $NF == "active" { ok=1 } END { exit !ok }'
+}"""
+
+
+def src_check_active(sub):
+    return 'src_active %s || { echo "%s is not active"; lssrc -s %s; exit 1; }' % (sub, sub, sub)
+
+
 def run_services(v, enabled, stop=False):
     """Stop subagents then the agent, start the agent then the subagents.
 
@@ -338,31 +348,35 @@ def run_services(v, enabled, stop=False):
     """
     subs = [s for s in S.SUBAGENTS if s in enabled]
     if stop:
-        lines = []
+        lines = [SRC_ACTIVE]
         if subs:
             lines.append("for s in %s; do lssrc -s $s >/dev/null 2>&1 && stopsrc -s $s; done" % " ".join(subs))
         lines += [
             "lssrc -s snmpd >/dev/null 2>&1 && stopsrc -s snmpd",
             "i=0",
-            "while lssrc -s snmpd 2>/dev/null | grep -q active; do sleep 1; i=$((i+1)); [ $i -ge 30 ] && break; done",
+            "while src_active snmpd; do sleep 1; i=$((i+1)); [ $i -ge 30 ] && break; done",
+            'if src_active snmpd; then echo "snmpd is still active"; exit 1; fi',
         ]
         rc, out = v.root("\n".join(lines), timeout=180)
         if rc != 0:
             raise V.Abort("stopping the SNMP daemons failed: %s" % out.strip()[-400:])
 
     lines = [
-        "lssrc -s snmpd 2>/dev/null | grep -q active || startsrc -s snmpd",
+        SRC_ACTIVE,
+        "src_active snmpd || startsrc -s snmpd || exit $?",
         "i=0",
-        "while ! lssrc -s snmpd 2>/dev/null | grep -q active; do sleep 1; i=$((i+1)); [ $i -ge 30 ] && break; done",
+        "while ! src_active snmpd; do sleep 1; i=$((i+1)); [ $i -ge 30 ] && break; done",
+        src_check_active("snmpd"),
     ]
     # The children's first connect attempt happens the moment they start, so let
     # snmpd finish listening first: 1473-665 in a child's log is that race.
     lines.append("sleep 5")
     for sub in subs:
-        lines.append("lssrc -s %s 2>/dev/null | grep -q active || startsrc -s %s" % (sub, sub))
+        lines.append("src_active %s || startsrc -s %s || exit $?" % (sub, sub))
     lines.append("sleep 5")
+    lines.extend(src_check_active(sub) for sub in ["snmpd"] + subs)
     rc, out = v.root("\n".join(lines), timeout=240)
-    if rc != 0 or "0513-" in out:
+    if rc != 0:
         raise V.Abort("starting the SNMP daemons failed: %s" % out.strip()[-600:])
     return out
 
@@ -393,11 +407,12 @@ def bounce_subsystems(v, subs):
     lines = [
         "for s in %s; do lssrc -s $s >/dev/null 2>&1 && stopsrc -s $s; done" % " ".join(subs),
         "sleep 2",
-        "for s in %s; do startsrc -s $s; done" % " ".join(subs),
+        "for s in %s; do startsrc -s $s || exit $?; done" % " ".join(subs),
         "sleep 3",
     ]
+    lines += [SRC_ACTIVE] + [src_check_active(sub) for sub in subs]
     rc, out = v.root("\n".join(lines), timeout=180)
-    if rc != 0 or "0513-" in out:
+    if rc != 0:
         raise V.Abort("bouncing %s failed: %s" % (", ".join(subs), out.strip()[-600:]))
     return out
 

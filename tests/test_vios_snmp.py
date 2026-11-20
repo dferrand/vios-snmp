@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 import unittest.mock
@@ -723,6 +724,59 @@ class RestartTest(unittest.TestCase):
         self.assertIn("startsrc -s aixmibd", start)
         self.assertFalse([c for c in fake.calls if c.startswith("cp ") or "chssys" in c])
 
+    def test_aix_success_messages_do_not_trigger_rollback(self):
+        fake = FakeVios()
+        root = fake.root
+
+        def aix_start(cmd, timeout=None):
+            rc, out = root(cmd, timeout)
+            if "startsrc" in cmd:
+                out += "\n".join("0513-059 The %s Subsystem has been started. Subsystem PID is %d."
+                                 % (sub, 14090516 + i) for i, sub in enumerate(S.SUBSYSTEMS))
+            return rc, out
+
+        fake.root = aix_start
+        rc, out, err = run(["--community", COMMUNITY, "--apply"], fake)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("applied and verified", out)
+        self.assertNotIn("rolling back", err)
+
+    def test_src_start_checks_command_status_and_exact_active_state(self):
+        for scenario in ("success", "failed", "inactive"):
+            with self.subTest(scenario=scenario):
+                fake = healthy()
+
+                def shell_root(cmd, timeout=None):
+                    setup = """sleep() { :; }
+                    lssrc() {
+                        case "$2" in
+                            snmpd) status=active;;
+                            aixmibd) status=${child_status:-inactive};;
+                        esac
+                        printf '%s tcpip 1234 %s\\n' "$2" "$status"
+                    }
+                    startsrc() {
+                        if [ "$scenario" = failed ]; then
+                            echo 'startsrc failed'
+                            return 7
+                        fi
+                        if [ "$scenario" = success ]; then child_status=active; fi
+                        echo '0513-059 The subsystem has been started.'
+                    }
+                    """
+                    result = subprocess.run(["sh", "-c", "scenario=" + scenario + "\n" + setup + cmd],
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            universal_newlines=True, timeout=5)
+                    return result.returncode, result.stdout
+
+                fake.root = shell_root
+                if scenario == "success":
+                    self.assertIn("0513-059", T.run_services(fake, ("snmpd", "aixmibd")))
+                else:
+                    expected = "startsrc failed" if scenario == "failed" else "aixmibd is not active"
+                    with self.assertRaisesRegex(V.Abort, expected):
+                        T.run_services(fake, ("snmpd", "aixmibd"))
+
     def test_restart_writes_nothing_even_when_the_files_drift(self):
         fake = FakeVios()
         fake.services = {s: "active" for s in S.SUBSYSTEMS}
@@ -747,7 +801,7 @@ class RestartTest(unittest.TestCase):
         self.assertIn("bouncing aixmibd, master left running", out)
         bounce = [c for c in fake.calls if "stopsrc" in c][0]
         self.assertIn("for s in aixmibd; do lssrc -s $s >/dev/null 2>&1 && stopsrc -s $s; done", bounce)
-        self.assertIn("for s in aixmibd; do startsrc -s $s; done", bounce)
+        self.assertIn("for s in aixmibd; do startsrc -s $s || exit $?; done", bounce)
         self.assertFalse([c for c in fake.calls if "stopsrc -s snmpd" in c])
 
     def test_restart_stands_on_its_own(self):
