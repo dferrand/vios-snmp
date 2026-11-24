@@ -287,5 +287,3 @@ the five expected lines moved.
 * SNMPv3 users, engine-ID handling, `pwtokey`.
 * Trap destinations.
 * Anything on the network side (firewall rules, allowed ports).
-* Only exercised against a fake VIOS so far — the first real run should be `--host <vios>`
-  with no `--community`, which is read-only.
