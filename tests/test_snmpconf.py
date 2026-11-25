@@ -1,14 +1,4 @@
-"""Edits to /etc/snmpdv3.conf and /etc/rc.tcpip, checked against the real files.
-
-The golden case is a factory VIOS file plus the hand-made configuration that runs
-on the lab VIOS: the rendered result must be functionally identical to that file
-(the two files are allowed to differ in whitespace, comments and therefore line
-order, since snmpdv3.conf states that entries are not order-dependent).
-
-The subagents' community is not a file at all: it lives in the SRC subsystem
-object, set with chssys, so it is tested as the small pure functions that build
-the chssys plan (IBM technote 884646).
-"""
+"""Test VIOS file edits and SRC subsystem plans with synthetic configurations."""
 import os
 import sys
 import unittest
@@ -40,15 +30,14 @@ class GoldenTest(unittest.TestCase):
     def setUp(self):
         self.out, self.changes = S.conf_desired(ORIG, community=COMMUNITY)
 
-    def test_matches_the_hand_made_file(self):
+    def test_matches_expected_configuration(self):
         self.assertEqual(without_traps(self.out), without_traps(ADJUSTED))
 
     def test_trap_entries_are_kept(self):
         self.assertEqual(S.trap_entries(self.out), S.trap_entries(ORIG))
 
     def test_prologue_is_untouched(self):
-        # Everything above the first active directive is IBM's header and the
-        # directive documentation; the tool must never write into it.
+        # Preserve comments and blank lines before the first active directive.
         first = [i for i, l in enumerate(ORIG.splitlines())
                  if l and l[0] not in "#*" and l.split()[0] in S.DIRECTIVES][0]
         self.assertEqual(self.out.splitlines()[:first], ORIG.splitlines()[:first])
@@ -76,7 +65,7 @@ class GoldenTest(unittest.TestCase):
     def test_only_the_expected_lines_change(self):
         touched = sorted(c.line for c in self.changes)
         # group, commented view, two exclusions, commented community: 5 lines, no rewrite
-        self.assertEqual(touched, [144, 146, 151, 156, 166])
+        self.assertEqual(touched, [4, 5, 7, 8, 15])
 
     def test_idempotent(self):
         again, changes = S.conf_desired(self.out, community=COMMUNITY)

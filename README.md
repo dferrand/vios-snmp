@@ -267,7 +267,7 @@ subagents, `(none)` meaning they answer `public`.
 vios_snmp.py            CLI: probe, plan, apply, verify, rollback
 vioslib/snmpconf.py     pure functions: parse / render / diff both files, build the chssys plan
 vioslib/vios.py         ssh/scp to the VIOS: run() as padmin, root() via oem_setup_env
-tests/test_snmpconf.py  the file edits and the chssys plan, against the real factory files
+tests/test_snmpconf.py  the file edits and the chssys plan, against synthetic fixtures
 tests/test_vios_snmp.py CLI end to end against a fake VIOS (files and ODM in memory)
 ```
 
@@ -277,13 +277,16 @@ tests/test_vios_snmp.py CLI end to end against a fake VIOS (files and ODM in mem
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/fixtures/` holds the factory `snmpdv3.conf`, the hand-made configuration from the lab
-VIOS and the stock `rc.tcpip`. The golden test asserts the rendered file is functionally
-identical to the hand-made one (same active directives, order-independent), and that only
-the five expected lines moved.
+`tests/fixtures/` contains synthetic `snmpdv3.conf` and `rc.tcpip` samples.
+The tests compare the rendered SNMP directives with the expected configuration
+and verify that the edit touches only the five expected lines.
 
 ## Not covered
 
 * SNMPv3 users, engine-ID handling, `pwtokey`.
 * Trap destinations.
 * Anything on the network side (firewall rules, allowed ports).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
